@@ -135,6 +135,7 @@ import com.google.zxing.common.detector.MathUtils;
 
 import org.telegram.PhoneFormat.PhoneFormat;
 import org.telegram.messenger.AccountInstance;
+import org.telegram.messenger.AiSummary;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.BotForumHelper;
@@ -1665,6 +1666,7 @@ public class ChatActivity extends BaseFragment implements
     private final static int charge_fee = 72;
 
     private final static int chat_menu_topic_create = 73;
+    private final static int ai_summary = 74;
 
     private final static int id_chat_compose_panel = 1000;
 
@@ -3943,6 +3945,8 @@ public class ChatActivity extends BaseFragment implements
                     if (!getMessagesController().getTranslateController().toggleTranslatingDialog(getDialogId(), true)) {
                         updateTopPanel(true);
                     }
+                } else if (id == ai_summary) {
+                    openAiSummary();
                 } else if (id == call || id == video_call) {
                     if (currentUser != null && getParentActivity() != null) {
                         VoIPHelper.startCall(currentUser, id == video_call, userInfo != null && userInfo.video_calls_available, getParentActivity(), getMessagesController().getUserFull(currentUser.id), getAccountInstance());
@@ -4384,6 +4388,7 @@ public class ChatActivity extends BaseFragment implements
             }
             translateItem = headerItem.lazilyAddSubItem(translate, R.drawable.msg_translate, LocaleController.getString(R.string.TranslateMessage));
             updateTranslateItemVisibility();
+            headerItem.lazilyAddSubItem(ai_summary, R.drawable.msg_stats, LocaleController.getString(R.string.AiSummary));
             if (currentChat != null && !currentChat.creator && !ChatObject.hasAdminRights(currentChat)) {
                 headerItem.lazilyAddSubItem(report, R.drawable.msg_report, LocaleController.getString(R.string.ReportChat));
             }
@@ -11159,6 +11164,84 @@ public class ChatActivity extends BaseFragment implements
             return;
         }
         translateItem.setVisibility(getMessagesController().getTranslateController().isTranslateDialogHidden(getDialogId()) && getMessagesController().getTranslateController().isDialogTranslatable(getDialogId()) ? View.VISIBLE : View.GONE);
+    }
+
+    private void openAiSummary() {
+        if (getParentActivity() == null) {
+            return;
+        }
+        if (!AiSummary.isConfigured()) {
+            showAiSummarySettings();
+            return;
+        }
+        String transcript = AiSummary.buildTranscript(messages, currentAccount);
+        if (transcript.isEmpty()) {
+            BulletinFactory.of(this).createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.AiSummaryEmpty)).show();
+            return;
+        }
+        AlertDialog progress = new AlertDialog(getParentActivity(), AlertDialog.ALERT_TYPE_SPINNER, themeDelegate);
+        progress.show();
+        AiSummary.request(transcript, (summary, error) -> {
+            progress.dismiss();
+            if (getParentActivity() == null) {
+                return;
+            }
+            if (error != null) {
+                new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                        .setTitle(LocaleController.getString(R.string.AiSummary))
+                        .setMessage(error)
+                        .setPositiveButton(LocaleController.getString(R.string.OK), null)
+                        .setNeutralButton(LocaleController.getString(R.string.Settings), (d, w) -> showAiSummarySettings())
+                        .show();
+                return;
+            }
+            new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                    .setTitle(LocaleController.getString(R.string.AiSummary))
+                    .setMessage(summary)
+                    .setPositiveButton(LocaleController.getString(R.string.OK), null)
+                    .setNeutralButton(LocaleController.getString(R.string.Copy), (d, w) -> {
+                        AndroidUtilities.addToClipboard(summary);
+                        BulletinFactory.of(this).createCopyBulletin(LocaleController.getString(R.string.TextCopied)).show();
+                    })
+                    .show();
+        });
+    }
+
+    private void showAiSummarySettings() {
+        if (getParentActivity() == null) {
+            return;
+        }
+        SharedPreferences prefs = AiSummary.prefs();
+        LinearLayout layout = new LinearLayout(getParentActivity());
+        layout.setOrientation(LinearLayout.VERTICAL);
+        EditTextBoldCursor baseUrlField = addAiSummaryField(layout, "Base URL (https://api.openai.com/v1)", prefs.getString(AiSummary.PREF_BASE_URL, ""));
+        EditTextBoldCursor apiKeyField = addAiSummaryField(layout, "API key", prefs.getString(AiSummary.PREF_API_KEY, ""));
+        EditTextBoldCursor modelField = addAiSummaryField(layout, "Model (gpt-4o-mini)", prefs.getString(AiSummary.PREF_MODEL, ""));
+
+        new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(LocaleController.getString(R.string.AiSummary))
+                .setMessage(LocaleController.getString(R.string.AiSummaryPrivacyNotice))
+                .setView(layout)
+                .setPositiveButton(LocaleController.getString(R.string.Save), (d, w) -> prefs.edit()
+                        .putString(AiSummary.PREF_BASE_URL, baseUrlField.getText().toString().trim())
+                        .putString(AiSummary.PREF_API_KEY, apiKeyField.getText().toString().trim())
+                        .putString(AiSummary.PREF_MODEL, modelField.getText().toString().trim())
+                        .apply())
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
+                .show();
+    }
+
+    private EditTextBoldCursor addAiSummaryField(LinearLayout parent, String hint, String value) {
+        EditTextBoldCursor field = new EditTextBoldCursor(getParentActivity());
+        field.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+        field.setTextColor(getThemedColor(Theme.key_dialogTextBlack));
+        field.setHintColor(getThemedColor(Theme.key_dialogTextHint));
+        field.setHintText(hint);
+        field.setSingleLine(true);
+        field.setText(value);
+        field.setBackgroundDrawable(null);
+        parent.addView(field, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 8, 0, 8));
+        return field;
     }
 
     private Animator infoTopViewAnimator;

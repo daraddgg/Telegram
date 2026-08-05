@@ -1392,6 +1392,9 @@
     <string name="DeleteRestrictUsers">Restrict users</string>
     <string name="DeleteReportSpam">Report spam</string>
     <string name="TranslateMessage">Translate</string>
+    <string name="AiSummary">AI Summary</string>
+    <string name="AiSummaryEmpty">No text messages loaded to summarize.</string>
+    <string name="AiSummaryPrivacyNotice">Loaded messages from this chat are sent to the AI provider you configure below. Credentials found in the text are redacted on-device first.</string>
     <string name="HideTranslation">Hide Translation</string>
     <string name="AutomaticTranslation">Automatic Translation</string>
     <string name="CloseTranslation">Close Translation</string>
