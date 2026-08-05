@@ -1,0 +1,44 @@
+name: Build debug APK
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK + CMake pinned by build.gradle
+        run: sdkmanager --install "ndk;27.2.12479018" "cmake;3.10.2.4988404" "build-tools;35.0.0" "platforms;android-35"
+
+      # BuildVars ships Telegram's own APP_ID=4, which is rejected for third-party builds.
+      # Set TELEGRAM_APP_ID / TELEGRAM_APP_HASH repo secrets (my.telegram.org) to get a loginable APK.
+      - name: Inject own API credentials
+        env:
+          APP_ID: ${{ secrets.TELEGRAM_APP_ID }}
+          APP_HASH: ${{ secrets.TELEGRAM_APP_HASH }}
+        run: |
+          if [ -z "$APP_ID" ]; then echo "::warning::no TELEGRAM_APP_ID secret, APK will not be able to log in"; exit 0; fi
+          f=TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+          sed -i "s/APP_ID = 4;/APP_ID = $APP_ID;/" "$f"
+          sed -i "s/APP_HASH = \"[^\"]*\"/APP_HASH = \"$APP_HASH\"/" "$f"
+          grep -n "APP_ID =" "$f"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: ./gradlew :TMessagesProj_App:assembleAfatDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: telegram-afat-debug
+          path: TMessagesProj_App/build/outputs/apk/afat/debug/*.apk
