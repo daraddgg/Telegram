@@ -1395,6 +1395,15 @@
     <string name="AiSummary">AI Summary</string>
     <string name="AiSummaryEmpty">No text messages loaded to summarize.</string>
     <string name="AiSummaryPrivacyNotice">Loaded messages from this chat are sent to the AI provider you configure below. Credentials found in the text are redacted on-device first.</string>
+    <string name="AiSummaryProvider">Provider</string>
+    <string name="AiSummarySampling">Sampling</string>
+    <string name="AiSummaryApiKey">API key</string>
+    <string name="AiSummaryStreaming">Streaming</string>
+    <string name="AiSummarySystemPrompt">System prompt</string>
+    <string name="AiSummaryRange">How many messages?</string>
+    <string name="AiSummaryLastMessages">Last %1$d messages</string>
+    <string name="AiSummaryCustomRange">Custom</string>
+    <string name="AiSummaryCustomRangeHint">Number of messages (min %1$d)</string>
     <string name="HideTranslation">Hide Translation</string>
     <string name="AutomaticTranslation">Automatic Translation</string>
     <string name="CloseTranslation">Close Translation</string>

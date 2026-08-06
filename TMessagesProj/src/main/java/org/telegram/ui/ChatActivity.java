@@ -65,6 +65,7 @@ import android.os.Vibrator;
 import android.provider.ContactsContract;
 import android.provider.MediaStore;
 import android.telephony.TelephonyManager;
+import android.text.InputType;
 import android.text.Layout;
 import android.text.Spannable;
 import android.text.SpannableString;
@@ -136,6 +137,7 @@ import com.google.zxing.common.detector.MathUtils;
 import org.telegram.PhoneFormat.PhoneFormat;
 import org.telegram.messenger.AccountInstance;
 import org.telegram.messenger.AiSummary;
+import org.telegram.messenger.AiSummaryFormat;
 import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.BotForumHelper;
@@ -11171,10 +11173,80 @@ public class ChatActivity extends BaseFragment implements
             return;
         }
         if (!AiSummary.isConfigured()) {
-            showAiSummarySettings();
+            presentFragment(new AiSummarySettingsActivity());
             return;
         }
-        String transcript = AiSummary.buildTranscript(messages, currentAccount);
+        showAiSummaryRangePicker();
+    }
+
+    private static final int[] AI_SUMMARY_RANGES = { 50, 100, 500, 1000 };
+
+    private void showAiSummaryRangePicker() {
+        CharSequence[] options = new CharSequence[AI_SUMMARY_RANGES.length + 1];
+        for (int i = 0; i < AI_SUMMARY_RANGES.length; i++) {
+            options[i] = LocaleController.formatString(R.string.AiSummaryLastMessages, AI_SUMMARY_RANGES[i]);
+        }
+        options[AI_SUMMARY_RANGES.length] = LocaleController.getString(R.string.AiSummaryCustomRange);
+
+        new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(LocaleController.getString(R.string.AiSummaryRange))
+                .setItems(options, (dialog, which) -> {
+                    if (which < AI_SUMMARY_RANGES.length) {
+                        runAiSummary(AI_SUMMARY_RANGES[which]);
+                    } else {
+                        showAiSummaryCustomRange();
+                    }
+                })
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
+                .show();
+    }
+
+    private void showAiSummaryCustomRange() {
+        EditTextBoldCursor field = new EditTextBoldCursor(getParentActivity());
+        field.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18);
+        field.setTextColor(getThemedColor(Theme.key_dialogTextBlack));
+        field.setHintColor(getThemedColor(Theme.key_dialogTextHint));
+        field.setHintText(LocaleController.formatString(R.string.AiSummaryCustomRangeHint, AiSummary.MIN_RANGE));
+        field.setInputType(InputType.TYPE_CLASS_NUMBER);
+        field.setSingleLine(true);
+        field.setBackgroundDrawable(null);
+        field.setPadding(dp(24), dp(8), dp(24), dp(8));
+
+        AlertDialog dialog = new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(LocaleController.getString(R.string.AiSummaryCustomRange))
+                .setView(field)
+                .setPositiveButton(LocaleController.getString(R.string.OK), null)
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
+                .create();
+        dialog.setOnShowListener(d -> {
+            View button = dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE);
+            if (button == null) {
+                return;
+            }
+            // Validate in place instead of dismissing: an out-of-range value must not silently run.
+            button.setOnClickListener(v -> {
+                int count;
+                try {
+                    count = Integer.parseInt(field.getText().toString().trim());
+                } catch (Exception e) {
+                    count = 0;
+                }
+                if (count < AiSummary.MIN_RANGE) {
+                    AndroidUtilities.shakeViewSpring(field, 3.5f);
+                    BulletinFactory.of(this).createSimpleBulletin(R.raw.error,
+                            LocaleController.formatString(R.string.AiSummaryCustomRangeHint, AiSummary.MIN_RANGE)).show();
+                    return;
+                }
+                dialog.dismiss();
+                runAiSummary(count);
+            });
+        });
+        dialog.show();
+        field.requestFocus();
+    }
+
+    private void runAiSummary(int count) {
+        List<String> transcript = AiSummary.buildTranscript(messages, currentAccount, count);
         if (transcript.isEmpty()) {
             BulletinFactory.of(this).createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.AiSummaryEmpty)).show();
             return;
@@ -11191,57 +11263,21 @@ public class ChatActivity extends BaseFragment implements
                         .setTitle(LocaleController.getString(R.string.AiSummary))
                         .setMessage(error)
                         .setPositiveButton(LocaleController.getString(R.string.OK), null)
-                        .setNeutralButton(LocaleController.getString(R.string.Settings), (d, w) -> showAiSummarySettings())
+                        .setNeutralButton(LocaleController.getString(R.string.Settings), (d, w) -> presentFragment(new AiSummarySettingsActivity()))
                         .show();
                 return;
             }
+            final String text = AiSummaryFormat.format(summary);
             new AlertDialog.Builder(getParentActivity(), themeDelegate)
                     .setTitle(LocaleController.getString(R.string.AiSummary))
-                    .setMessage(summary)
+                    .setMessage(text)
                     .setPositiveButton(LocaleController.getString(R.string.OK), null)
                     .setNeutralButton(LocaleController.getString(R.string.Copy), (d, w) -> {
-                        AndroidUtilities.addToClipboard(summary);
+                        AndroidUtilities.addToClipboard(text);
                         BulletinFactory.of(this).createCopyBulletin(LocaleController.getString(R.string.TextCopied)).show();
                     })
                     .show();
         });
-    }
-
-    private void showAiSummarySettings() {
-        if (getParentActivity() == null) {
-            return;
-        }
-        SharedPreferences prefs = AiSummary.prefs();
-        LinearLayout layout = new LinearLayout(getParentActivity());
-        layout.setOrientation(LinearLayout.VERTICAL);
-        EditTextBoldCursor baseUrlField = addAiSummaryField(layout, "Base URL (https://api.openai.com/v1)", prefs.getString(AiSummary.PREF_BASE_URL, ""));
-        EditTextBoldCursor apiKeyField = addAiSummaryField(layout, "API key", prefs.getString(AiSummary.PREF_API_KEY, ""));
-        EditTextBoldCursor modelField = addAiSummaryField(layout, "Model (gpt-4o-mini)", prefs.getString(AiSummary.PREF_MODEL, ""));
-
-        new AlertDialog.Builder(getParentActivity(), themeDelegate)
-                .setTitle(LocaleController.getString(R.string.AiSummary))
-                .setMessage(LocaleController.getString(R.string.AiSummaryPrivacyNotice))
-                .setView(layout)
-                .setPositiveButton(LocaleController.getString(R.string.Save), (d, w) -> prefs.edit()
-                        .putString(AiSummary.PREF_BASE_URL, baseUrlField.getText().toString().trim())
-                        .putString(AiSummary.PREF_API_KEY, apiKeyField.getText().toString().trim())
-                        .putString(AiSummary.PREF_MODEL, modelField.getText().toString().trim())
-                        .apply())
-                .setNegativeButton(LocaleController.getString(R.string.Cancel), null)
-                .show();
-    }
-
-    private EditTextBoldCursor addAiSummaryField(LinearLayout parent, String hint, String value) {
-        EditTextBoldCursor field = new EditTextBoldCursor(getParentActivity());
-        field.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
-        field.setTextColor(getThemedColor(Theme.key_dialogTextBlack));
-        field.setHintColor(getThemedColor(Theme.key_dialogTextHint));
-        field.setHintText(hint);
-        field.setSingleLine(true);
-        field.setText(value);
-        field.setBackgroundDrawable(null);
-        parent.addView(field, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 8, 0, 8));
-        return field;
     }
 
     private Animator infoTopViewAnimator;

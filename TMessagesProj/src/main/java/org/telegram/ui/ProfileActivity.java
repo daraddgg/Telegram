@@ -620,6 +620,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
     private int settingsSectionRow2;
     private int notificationRow;
     private int languageRow;
+    private int aiSummaryRow;
     private int privacyRow;
     private int dataRow;
     private int chatRow;
@@ -4547,6 +4548,8 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                 showDialog(builder1.create());
             } else if (position == languageRow) {
                 presentFragment(new LanguageSelectActivity());
+            } else if (position == aiSummaryRow) {
+                presentFragment(new AiSummarySettingsActivity());
             } else if (position == setUsernameRow) {
                 presentFragment(new ChangeUsernameActivity());
             } else if (position == bioRow) {
@@ -10441,6 +10444,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
         settingsSectionRow2 = -1;
         notificationRow = -1;
         languageRow = -1;
+        aiSummaryRow = -1;
         premiumRow = -1;
         starsRow = -1;
         tonRow = -1;
@@ -10621,6 +10625,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                 }
                 devicesRow = rowCount++;
                 languageRow = rowCount++;
+                aiSummaryRow = rowCount++;
                 devicesSectionRow = rowCount++;
                 if (!getMessagesController().premiumFeaturesBlocked()) {
                     premiumRow = rowCount++;
@@ -13801,6 +13806,8 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     } else if (position == languageRow) {
                         textCell.setTextAndValueAndIcon(LocaleController.getString(R.string.Language), LocaleController.getCurrentLanguageName(), false, R.drawable.msg2_language, false);
                         textCell.setImageLeft(23);
+                    } else if (position == aiSummaryRow) {
+                        textCell.setTextAndIcon(LocaleController.getString(R.string.AiSummary), R.drawable.msg_stats, false);
                     } else if (position == notificationRow) {
                         textCell.setTextAndIcon(LocaleController.getString(R.string.NotificationsAndSounds), R.drawable.msg2_notifications, true);
                     } else if (position == privacyRow) {
@@ -14247,7 +14254,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
             if (notificationRow != -1) {
                 int position = holder.getAdapterPosition();
                 return position == notificationRow || position == numberRow || position == privacyRow ||
-                        position == languageRow || position == setUsernameRow || position == bioRow ||
+                        position == languageRow || position == aiSummaryRow || position == setUsernameRow || position == bioRow ||
                         position == versionRow || position == dataRow || position == chatRow ||
                         position == questionRow || position == devicesRow || position == filtersRow || position == stickersRow ||
                         position == faqRow || position == policyRow || position == sendLogsRow || position == sendLastLogsRow ||
@@ -14294,7 +14301,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
                     position == subscribersRow || position == subscribersRequestsRow || position == administratorsRow || position == settingsRow || position == blockedUsersRow ||
                     position == addMemberRow || position == joinRow || position == unblockRow ||
                     position == sendMessageRow || position == notificationRow || position == privacyRow ||
-                    position == languageRow || position == dataRow || position == chatRow ||
+                    position == languageRow || position == aiSummaryRow || position == dataRow || position == chatRow ||
                     position == questionRow || position == devicesRow || position == filtersRow || position == stickersRow ||
                     position == faqRow || position == policyRow || position == sendLogsRow || position == sendLastLogsRow ||
                     position == clearLogsRow || position == switchBackendRow || position == setAvatarRow || position == addToGroupButtonRow ||
@@ -15651,6 +15658,7 @@ public class ProfileActivity extends BaseFragment implements NotificationCenter.
             put(++pointer, settingsSectionRow2, sparseIntArray);
             put(++pointer, notificationRow, sparseIntArray);
             put(++pointer, languageRow, sparseIntArray);
+            put(++pointer, aiSummaryRow, sparseIntArray);
             put(++pointer, premiumRow, sparseIntArray);
             put(++pointer, starsRow, sparseIntArray);
             put(++pointer, businessRow, sparseIntArray);
