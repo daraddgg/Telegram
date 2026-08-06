@@ -3243,7 +3243,11 @@ public class LoginActivity extends BaseFragment implements NotificationCenter.No
                 if (!isRequestingFirebaseSms) {
                     needHideProgress(false);
                 }
-            }), ConnectionsManager.RequestFlagFailOnServerErrors | ConnectionsManager.RequestFlagWithoutLogin | ConnectionsManager.RequestFlagTryDifferentDc | ConnectionsManager.RequestFlagEnableUnauthorized);
+            // `auth.sendCode` is not idempotent: RequestFlagTryDifferentDc re-queues the request onto a random
+            // datacenter after 30s of silence, so a slow first attempt that the server did accept gets sent a
+            // second time and comes back PHONE_NUMBER_FLOOD while the SMS is already on its way. DC failover is
+            // still covered by the help.getConfig probe in the native layer.
+            }), ConnectionsManager.RequestFlagFailOnServerErrors | ConnectionsManager.RequestFlagWithoutLogin | ConnectionsManager.RequestFlagEnableUnauthorized);
             needShowProgress(reqId);
         }
 
