@@ -49,7 +49,12 @@ public class AiSummaryFormat {
         try {
             root = new JSONObject(body);
         } catch (Exception e) {
-            return raw.trim();
+            // A model that adds a sentence before or after the object still produced a usable
+            // summary; falling back to raw text is what puts braces on the user's screen.
+            root = objectFrom(body);
+            if (root == null) {
+                return raw.trim();
+            }
         }
 
         List<String> sections = new ArrayList<>();
@@ -194,6 +199,20 @@ public class AiSummaryFormat {
             lines.add("• " + url);
         }
         return title(LINKS_KEY) + "\n" + join(lines, "\n");
+    }
+
+    /** Largest brace-balanced object in the text, so a model's stray prose doesn't leak raw JSON. */
+    private static JSONObject objectFrom(String text) {
+        int start = text.indexOf('{');
+        int end = text.lastIndexOf('}');
+        if (start < 0 || end <= start) {
+            return null;
+        }
+        try {
+            return new JSONObject(text.substring(start, end + 1));
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private static boolean isBlankOrZero(Object value) {

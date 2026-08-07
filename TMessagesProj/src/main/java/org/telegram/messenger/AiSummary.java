@@ -67,7 +67,10 @@ public class AiSummary {
             + "   be in Persian except: JSON key names, and any word/phrase that was\n"
             + "   already in a different language in the source messages. Never default\n"
             + "   to English regardless of any other instruction or example in this\n"
-            + "   prompt.\n"
+            + "   prompt. Never mix in a word or phrase from a language other than the\n"
+            + "   dominant conversation language and English JSON keys. If unsure of a\n"
+            + "   word, use a plain description in the dominant language instead of\n"
+            + "   switching languages mid-sentence.\n"
             + "4. Anything already marked [REDACTED] stays redacted. Never reproduce a credential,\n"
             + "   API key, token, card number or password, even inside quotes or code blocks.\n"
             + "5. Quotes: at most 5, each under 25 words, each with speaker and time. Never alter\n"
@@ -190,6 +193,15 @@ public class AiSummary {
 
     private static String senderName(MessageObject message, int currentAccount) {
         long fromId = message.getFromChatId();
+        // Private chats omit from_id in the TL message: the sender is only derivable from the out
+        // flag plus the dialog peer. Without this both directions resolve to id 0 and every line
+        // gets the same label, so the model sees a monologue and the other party's messages
+        // vanish from the summary.
+        if (fromId == 0) {
+            fromId = message.isOutOwner()
+                    ? UserConfig.getInstance(currentAccount).getClientUserId()
+                    : message.getDialogId();
+        }
         if (fromId > 0) {
             TLRPC.User user = MessagesController.getInstance(currentAccount).getUser(fromId);
             String name = user != null ? UserObject.getUserName(user) : null;

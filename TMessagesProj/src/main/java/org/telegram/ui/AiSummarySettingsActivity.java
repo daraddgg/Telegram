@@ -75,7 +75,9 @@ public class AiSummarySettingsActivity extends BaseFragment {
     @Override
     public View createView(Context context) {
         actionBar.setBackButtonImage(R.drawable.ic_ab_back);
-        actionBar.setAllowOverlayTitle(true);
+        // No overlay title: the connection-state overlay ("Updating…", "Connecting…") would
+        // otherwise replace this screen's own title.
+        actionBar.setAllowOverlayTitle(false);
         actionBar.setTitle(LocaleController.getString(R.string.AiSummary));
         actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
             @Override
@@ -124,7 +126,8 @@ public class AiSummarySettingsActivity extends BaseFragment {
         RecyclerListView listView = new RecyclerListView(context);
         listView.setLayoutManager(new LinearLayoutManager(context, LinearLayoutManager.VERTICAL, false));
         listView.setAdapter(new ListAdapter());
-        listView.setClipToPadding(false);
+        // Clipping stays on: with clipToPadding(false) the last rows draw inside the bottom
+        // padding, i.e. underneath the pinned Save button, which is exactly what hid the notice.
         listView.setPadding(0, 0, 0, dp(72));
         listView.setOnItemClickListener((view, position) -> {
             if (position == ROW_STREAMING) {
