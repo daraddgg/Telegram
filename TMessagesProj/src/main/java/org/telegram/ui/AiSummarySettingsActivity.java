@@ -1,48 +1,76 @@
 package org.telegram.ui;
 
+import static org.telegram.messenger.AndroidUtilities.dp;
+
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.text.InputType;
+import android.util.TypedValue;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import org.telegram.messenger.AiSummary;
+import org.telegram.messenger.AndroidUtilities;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.R;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.BaseFragment;
 import org.telegram.ui.ActionBar.Theme;
-import org.telegram.ui.Cells.EditTextCell;
 import org.telegram.ui.Cells.HeaderCell;
+import org.telegram.ui.Cells.ShadowSectionCell;
 import org.telegram.ui.Cells.TextCheckCell;
 import org.telegram.ui.Cells.TextInfoPrivacyCell;
+import org.telegram.ui.Cells.TextSettingsCell;
+import org.telegram.ui.Components.EditTextBoldCursor;
 import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.RecyclerListView;
 
 /**
- * Editable AI Summary provider configuration. Values are persisted on fragment destroy.
+ * Editable AI Summary provider configuration, reachable from the main Settings list.
  *
- * The stored API key is never rendered: the field shows a mask and is only written back when the
- * user types a replacement.
+ * Every field carries a visible label, values are loaded from prefs on open, and a pinned Save
+ * button commits them. The stored API key is never rendered: the field shows a mask and is only
+ * written back when the user types a replacement.
  */
 public class AiSummarySettingsActivity extends BaseFragment {
 
-    private EditTextCell baseUrlCell;
-    private EditTextCell apiKeyCell;
-    private EditTextCell modelCell;
-    private EditTextCell temperatureCell;
-    private EditTextCell maxTokensCell;
-    private EditTextCell topPCell;
-    private EditTextCell promptCell;
-    private EditTextCell headersCell;
-    private boolean streaming;
+    private static final int ROW_PROVIDER_HEADER = 0;
+    private static final int ROW_BASE_URL = 1;
+    private static final int ROW_API_KEY = 2;
+    private static final int ROW_MODEL = 3;
+    private static final int ROW_PROVIDER_SHADOW = 4;
+    private static final int ROW_SAMPLING_HEADER = 5;
+    private static final int ROW_TEMPERATURE = 6;
+    private static final int ROW_MAX_TOKENS = 7;
+    private static final int ROW_TOP_P = 8;
+    private static final int ROW_SAMPLING_SHADOW = 9;
+    private static final int ROW_ADVANCED_HEADER = 10;
+    private static final int ROW_STREAMING = 11;
+    private static final int ROW_SYSTEM_PROMPT = 12;
+    private static final int ROW_HEADERS = 13;
+    private static final int ROW_NOTICE = 14;
+    private static final int ROW_COUNT = 15;
 
+    private LabeledEditCell baseUrlCell;
+    private LabeledEditCell apiKeyCell;
+    private LabeledEditCell modelCell;
+    private LabeledEditCell temperatureCell;
+    private LabeledEditCell maxTokensCell;
+    private LabeledEditCell topPCell;
+    private LabeledEditCell headersCell;
+    private TextSettingsCell promptCell;
+
+    private boolean streaming;
     private String maskedKey;
+    private String systemPrompt;
 
     @Override
     public View createView(Context context) {
@@ -58,51 +86,90 @@ public class AiSummarySettingsActivity extends BaseFragment {
             }
         });
 
+        // Stored values are the source of truth for what the fields show; an unset provider URL
+        // falls back to the real default rather than an empty box with a misleading hint.
         SharedPreferences prefs = AiSummary.prefs();
         maskedKey = AiSummary.maskKey(prefs.getString(AiSummary.PREF_API_KEY, ""));
         streaming = prefs.getBoolean(AiSummary.PREF_STREAMING, false);
+        systemPrompt = AiSummary.systemPrompt();
 
-        baseUrlCell = textField(context, AiSummary.DEFAULT_BASE_URL, prefs.getString(AiSummary.PREF_BASE_URL, ""));
-        apiKeyCell = textField(context, maskedKey.isEmpty() ? LocaleController.getString(R.string.AiSummaryApiKey) : maskedKey, "");
+        baseUrlCell = new LabeledEditCell(context, LocaleController.getString(R.string.AiSummaryBaseUrl),
+                AiSummary.DEFAULT_BASE_URL, prefs.getString(AiSummary.PREF_BASE_URL, AiSummary.DEFAULT_BASE_URL), false);
+        apiKeyCell = new LabeledEditCell(context, LocaleController.getString(R.string.AiSummaryApiKey),
+                maskedKey.isEmpty() ? LocaleController.getString(R.string.AiSummaryApiKeyHint) : maskedKey, "", false);
         apiKeyCell.editText.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        modelCell = textField(context, AiSummary.DEFAULT_MODEL, prefs.getString(AiSummary.PREF_MODEL, ""));
-        temperatureCell = numberField(context, "temperature", floatText(prefs.getFloat(AiSummary.PREF_TEMPERATURE, AiSummary.DEFAULT_TEMPERATURE)), true);
-        maxTokensCell = numberField(context, "max_tokens", String.valueOf(prefs.getInt(AiSummary.PREF_MAX_TOKENS, AiSummary.DEFAULT_MAX_TOKENS)), false);
-        topPCell = numberField(context, "top_p", floatText(prefs.getFloat(AiSummary.PREF_TOP_P, AiSummary.DEFAULT_TOP_P)), true);
-        promptCell = new EditTextCell(context, LocaleController.getString(R.string.AiSummarySystemPrompt), true, false, -1, getResourceProvider());
-        promptCell.setText(AiSummary.systemPrompt());
-        promptCell.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
-        headersCell = textField(context, "X-Header: value", prefs.getString(AiSummary.PREF_HEADERS, ""));
+        modelCell = new LabeledEditCell(context, LocaleController.getString(R.string.AiSummaryModel),
+                AiSummary.DEFAULT_MODEL, prefs.getString(AiSummary.PREF_MODEL, AiSummary.DEFAULT_MODEL), false);
 
-        fragmentView = new FrameLayout(context);
-        FrameLayout frameLayout = (FrameLayout) fragmentView;
-        frameLayout.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundGray));
+        temperatureCell = new LabeledEditCell(context, LocaleController.getString(R.string.AiSummaryTemperature),
+                "0.2", floatText(prefs.getFloat(AiSummary.PREF_TEMPERATURE, AiSummary.DEFAULT_TEMPERATURE)), false);
+        temperatureCell.editText.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        maxTokensCell = new LabeledEditCell(context, LocaleController.getString(R.string.AiSummaryMaxTokens),
+                "4096", String.valueOf(prefs.getInt(AiSummary.PREF_MAX_TOKENS, AiSummary.DEFAULT_MAX_TOKENS)), false);
+        maxTokensCell.editText.setInputType(InputType.TYPE_CLASS_NUMBER);
+        topPCell = new LabeledEditCell(context, LocaleController.getString(R.string.AiSummaryTopP),
+                "1", floatText(prefs.getFloat(AiSummary.PREF_TOP_P, AiSummary.DEFAULT_TOP_P)), false);
+        topPCell.editText.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+
+        headersCell = new LabeledEditCell(context, LocaleController.getString(R.string.AiSummaryCustomHeaders),
+                "X-Title: MyApp", prefs.getString(AiSummary.PREF_HEADERS, ""), true);
+
+        promptCell = new TextSettingsCell(context);
+        promptCell.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
+        updatePromptCell();
+
+        FrameLayout root = new FrameLayout(context);
+        root.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundGray));
 
         RecyclerListView listView = new RecyclerListView(context);
         listView.setLayoutManager(new LinearLayoutManager(context, LinearLayoutManager.VERTICAL, false));
         listView.setAdapter(new ListAdapter());
+        listView.setClipToPadding(false);
+        listView.setPadding(0, 0, 0, dp(72));
         listView.setOnItemClickListener((view, position) -> {
-            if (view instanceof TextCheckCell) {
+            if (position == ROW_STREAMING) {
                 streaming = !streaming;
                 ((TextCheckCell) view).setChecked(streaming);
+            } else if (position == ROW_SYSTEM_PROMPT) {
+                presentFragment(new PromptEditorActivity(this));
             }
         });
-        frameLayout.addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+        root.addView(listView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+
+        // Pinned so the action is reachable without scrolling past the prompt and headers fields.
+        TextView saveButton = new TextView(context);
+        saveButton.setGravity(Gravity.CENTER);
+        saveButton.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
+        saveButton.setTypeface(AndroidUtilities.bold());
+        saveButton.setTextColor(getThemedColor(Theme.key_featuredStickers_buttonText));
+        saveButton.setText(LocaleController.getString(R.string.Save));
+        saveButton.setBackground(Theme.AdaptiveRipple.filledRect(getThemedColor(Theme.key_featuredStickers_addButton), 8));
+        saveButton.setOnClickListener(v -> {
+            save();
+            finishFragment();
+        });
+        root.addView(saveButton, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 48, Gravity.BOTTOM, 12, 0, 12, 12));
+
+        fragmentView = root;
         return fragmentView;
     }
 
-    private EditTextCell textField(Context context, String hint, String value) {
-        EditTextCell cell = new EditTextCell(context, hint, false, false, -1, getResourceProvider());
-        cell.setText(value);
-        cell.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
-        cell.setDivider(true);
-        return cell;
+    void setSystemPrompt(String prompt) {
+        systemPrompt = prompt == null || prompt.trim().isEmpty() ? AiSummary.DEFAULT_SYSTEM_PROMPT : prompt;
+        updatePromptCell();
     }
 
-    private EditTextCell numberField(Context context, String hint, String value, boolean decimal) {
-        EditTextCell cell = textField(context, hint, value);
-        cell.editText.setInputType(InputType.TYPE_CLASS_NUMBER | (decimal ? InputType.TYPE_NUMBER_FLAG_DECIMAL : 0));
-        return cell;
+    String getSystemPrompt() {
+        return systemPrompt;
+    }
+
+    private void updatePromptCell() {
+        if (promptCell == null) {
+            return;
+        }
+        boolean custom = !AiSummary.DEFAULT_SYSTEM_PROMPT.equals(systemPrompt);
+        promptCell.setTextAndValue(LocaleController.getString(R.string.AiSummarySystemPrompt),
+                LocaleController.getString(custom ? R.string.AiSummaryPromptCustom : R.string.AiSummaryPromptDefault), true);
     }
 
     private static String floatText(float value) {
@@ -120,31 +187,26 @@ public class AiSummarySettingsActivity extends BaseFragment {
             return;
         }
         SharedPreferences.Editor editor = AiSummary.prefs().edit()
-                .putString(AiSummary.PREF_BASE_URL, text(baseUrlCell))
-                .putString(AiSummary.PREF_MODEL, text(modelCell))
-                .putFloat(AiSummary.PREF_TEMPERATURE, parseFloat(text(temperatureCell), AiSummary.DEFAULT_TEMPERATURE))
-                .putInt(AiSummary.PREF_MAX_TOKENS, parseInt(text(maxTokensCell), AiSummary.DEFAULT_MAX_TOKENS))
-                .putFloat(AiSummary.PREF_TOP_P, parseFloat(text(topPCell), AiSummary.DEFAULT_TOP_P))
+                .putString(AiSummary.PREF_BASE_URL, baseUrlCell.text())
+                .putString(AiSummary.PREF_MODEL, modelCell.text())
+                .putFloat(AiSummary.PREF_TEMPERATURE, parseFloat(temperatureCell.text(), AiSummary.DEFAULT_TEMPERATURE))
+                .putInt(AiSummary.PREF_MAX_TOKENS, parseInt(maxTokensCell.text(), AiSummary.DEFAULT_MAX_TOKENS))
+                .putFloat(AiSummary.PREF_TOP_P, parseFloat(topPCell.text(), AiSummary.DEFAULT_TOP_P))
                 .putBoolean(AiSummary.PREF_STREAMING, streaming)
-                .putString(AiSummary.PREF_HEADERS, text(headersCell));
+                .putString(AiSummary.PREF_HEADERS, headersCell.text());
 
-        String prompt = text(promptCell);
-        if (prompt.isEmpty() || prompt.equals(AiSummary.DEFAULT_SYSTEM_PROMPT)) {
+        if (systemPrompt == null || systemPrompt.trim().isEmpty() || systemPrompt.equals(AiSummary.DEFAULT_SYSTEM_PROMPT)) {
             editor.remove(AiSummary.PREF_SYSTEM_PROMPT);
         } else {
-            editor.putString(AiSummary.PREF_SYSTEM_PROMPT, prompt);
+            editor.putString(AiSummary.PREF_SYSTEM_PROMPT, systemPrompt);
         }
 
         // An untouched key field shows only the mask, so writing it back would destroy the real key.
-        String key = text(apiKeyCell);
+        String key = apiKeyCell.text();
         if (!key.isEmpty() && !key.equals(maskedKey)) {
             editor.putString(AiSummary.PREF_API_KEY, key);
         }
         editor.apply();
-    }
-
-    private static String text(EditTextCell cell) {
-        return cell.getText() == null ? "" : cell.getText().toString().trim();
     }
 
     private static float parseFloat(String value, float fallback) {
@@ -163,38 +225,83 @@ public class AiSummarySettingsActivity extends BaseFragment {
         }
     }
 
+    /** Label above the input so a bare number like "0.2" is never shown without its meaning. */
+    private class LabeledEditCell extends LinearLayout {
+
+        final EditTextBoldCursor editText;
+
+        LabeledEditCell(Context context, String label, String hint, String value, boolean multiline) {
+            super(context);
+            setOrientation(VERTICAL);
+            setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
+            setPadding(dp(21), dp(10), dp(21), dp(10));
+
+            TextView labelView = new TextView(context);
+            labelView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
+            labelView.setTextColor(getThemedColor(Theme.key_windowBackgroundWhiteBlueHeader));
+            labelView.setText(label);
+            addView(labelView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+
+            editText = new EditTextBoldCursor(context);
+            editText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+            editText.setTextColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText));
+            editText.setHintTextColor(getThemedColor(Theme.key_windowBackgroundWhiteHintText));
+            editText.setBackgroundDrawable(null);
+            editText.setPadding(0, dp(4), 0, 0);
+            editText.setHint(hint);
+            editText.setText(value);
+            editText.setSingleLine(!multiline);
+            if (multiline) {
+                editText.setMaxLines(4);
+                editText.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+            }
+            addView(editText, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        }
+
+        String text() {
+            return editText.getText() == null ? "" : editText.getText().toString().trim();
+        }
+    }
+
     private class ListAdapter extends RecyclerListView.SelectionAdapter {
 
-        // Every row is a distinct view type, so each cell instance is its own holder and nothing
-        // gets recycled into the wrong slot. The list is short and fully visible in one screen.
+        // One view type per row: each configured cell is its own holder, so no cell can be
+        // recycled into another row's slot and lose the value the user typed.
         @NonNull
         @Override
         public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
             View view;
             switch (viewType) {
-                case 0:
+                case ROW_PROVIDER_HEADER:
                     view = header(LocaleController.getString(R.string.AiSummaryProvider));
                     break;
-                case 1: view = baseUrlCell; break;
-                case 2: view = apiKeyCell; break;
-                case 3: view = modelCell; break;
-                case 4:
+                case ROW_BASE_URL: view = baseUrlCell; break;
+                case ROW_API_KEY: view = apiKeyCell; break;
+                case ROW_MODEL: view = modelCell; break;
+                case ROW_SAMPLING_HEADER:
                     view = header(LocaleController.getString(R.string.AiSummarySampling));
                     break;
-                case 5: view = temperatureCell; break;
-                case 6: view = maxTokensCell; break;
-                case 7: view = topPCell; break;
-                case 8:
+                case ROW_TEMPERATURE: view = temperatureCell; break;
+                case ROW_MAX_TOKENS: view = maxTokensCell; break;
+                case ROW_TOP_P: view = topPCell; break;
+                case ROW_ADVANCED_HEADER:
+                    view = header(LocaleController.getString(R.string.AiSummaryAdvanced));
+                    break;
+                case ROW_STREAMING:
                     TextCheckCell check = new TextCheckCell(getContext());
+                    check.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
                     check.setTextAndCheck(LocaleController.getString(R.string.AiSummaryStreaming), streaming, true);
                     view = check;
                     break;
-                case 9: view = promptCell; break;
-                case 10: view = headersCell; break;
-                default:
+                case ROW_SYSTEM_PROMPT: view = promptCell; break;
+                case ROW_HEADERS: view = headersCell; break;
+                case ROW_NOTICE:
                     TextInfoPrivacyCell info = new TextInfoPrivacyCell(getContext());
                     info.setText(LocaleController.getString(R.string.AiSummaryPrivacyNotice));
                     view = info;
+                    break;
+                default:
+                    view = new ShadowSectionCell(getContext());
                     break;
             }
             return new RecyclerListView.Holder(view);
@@ -218,12 +325,72 @@ public class AiSummarySettingsActivity extends BaseFragment {
 
         @Override
         public int getItemCount() {
-            return 12;
+            return ROW_COUNT;
         }
 
         @Override
         public boolean isEnabled(RecyclerView.ViewHolder holder) {
-            return holder.getItemViewType() == 8;
+            int type = holder.getItemViewType();
+            return type == ROW_STREAMING || type == ROW_SYSTEM_PROMPT;
+        }
+    }
+
+    /** Full-screen editor so the multi-page prompt never sits inline in the settings list. */
+    public static class PromptEditorActivity extends BaseFragment {
+
+        private static final int done_button = 1;
+
+        private final AiSummarySettingsActivity parent;
+        private EditTextBoldCursor editText;
+
+        public PromptEditorActivity(AiSummarySettingsActivity parent) {
+            this.parent = parent;
+        }
+
+        @Override
+        public View createView(Context context) {
+            actionBar.setBackButtonImage(R.drawable.ic_ab_back);
+            actionBar.setAllowOverlayTitle(true);
+            actionBar.setTitle(LocaleController.getString(R.string.AiSummarySystemPrompt));
+            actionBar.createMenu().addItem(done_button, R.drawable.ic_ab_done);
+            actionBar.setActionBarMenuOnItemClick(new ActionBar.ActionBarMenuOnItemClick() {
+                @Override
+                public void onItemClick(int id) {
+                    if (id == -1) {
+                        finishFragment();
+                    } else if (id == done_button) {
+                        parent.setSystemPrompt(editText.getText().toString());
+                        finishFragment();
+                    }
+                }
+            });
+
+            FrameLayout root = new FrameLayout(context);
+            root.setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
+
+            editText = new EditTextBoldCursor(context);
+            editText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
+            editText.setTextColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText));
+            editText.setBackgroundDrawable(null);
+            editText.setGravity(Gravity.TOP | Gravity.START);
+            editText.setPadding(dp(18), dp(14), dp(18), dp(14));
+            editText.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+            editText.setSingleLine(false);
+            editText.setText(parent.getSystemPrompt());
+            root.addView(editText, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT));
+
+            TextView resetButton = new TextView(context);
+            resetButton.setGravity(Gravity.CENTER);
+            resetButton.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15);
+            resetButton.setTypeface(AndroidUtilities.bold());
+            resetButton.setTextColor(getThemedColor(Theme.key_featuredStickers_buttonText));
+            resetButton.setText(LocaleController.getString(R.string.AiSummaryPromptReset));
+            resetButton.setBackground(Theme.AdaptiveRipple.filledRect(getThemedColor(Theme.key_featuredStickers_addButton), 8));
+            resetButton.setOnClickListener(v -> editText.setText(AiSummary.DEFAULT_SYSTEM_PROMPT));
+            root.addView(resetButton, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 44, Gravity.BOTTOM, 12, 0, 12, 12));
+
+            fragmentView = root;
+            return fragmentView;
         }
     }
 }

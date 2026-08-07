@@ -13,8 +13,11 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Summarizes a chat transcript through an OpenAI-compatible chat/completions endpoint.
@@ -57,8 +60,14 @@ public class AiSummary {
             + "   it empty — do not fabricate placeholder content.\n"
             + "2. Attribute action items to a person only when the assignment is clear from\n"
             + "   context. Otherwise use \"Unknown Owner\".\n"
-            + "3. Detect the dominant language of the conversation and write summary prose in that\n"
-            + "   language. Direct quotes stay in their original language. JSON keys stay English.\n"
+            + "3. LANGUAGE — Detect the dominant language of the conversation from the actual message\n"
+            + "   text provided. Write ALL prose string values in every field (summaries,\n"
+            + "   hot topics, insights, the text around quotes, etc.) in that exact\n"
+            + "   language. If the dominant language is Persian, every string value must\n"
+            + "   be in Persian except: JSON key names, and any word/phrase that was\n"
+            + "   already in a different language in the source messages. Never default\n"
+            + "   to English regardless of any other instruction or example in this\n"
+            + "   prompt.\n"
             + "4. Anything already marked [REDACTED] stays redacted. Never reproduce a credential,\n"
             + "   API key, token, card number or password, even inside quotes or code blocks.\n"
             + "5. Quotes: at most 5, each under 25 words, each with speaker and time. Never alter\n"
@@ -66,7 +75,12 @@ public class AiSummary {
             + "6. Sentiment percentages must sum to 100.\n"
             + "7. If the range contains zero usable messages, return the schema with empty fields\n"
             + "   and set meta.note to explain why.\n"
-            + "8. Output ONLY valid JSON matching the schema below. No markdown fences, no\n"
+            + "8. DATES — For any date or timestamp you output (timeline entries, quote timestamps,\n"
+            + "   etc.), use ONLY the exact date/time values provided with each message in\n"
+            + "   the input. Never infer, assume, or default to a year or date from your own\n"
+            + "   training data or general knowledge — if a message's date isn't explicitly\n"
+            + "   provided in the input, omit the date rather than guessing one.\n"
+            + "9. Output ONLY valid JSON matching the schema below. No markdown fences, no\n"
             + "   commentary, no preamble or postamble.\n"
             + "\n"
             + "SIGNIFICANCE FILTER — apply before populating any section:\n"
@@ -98,11 +112,11 @@ public class AiSummary {
             + "  \"shared_content\": { \"photos\": 0, \"videos\": 0, \"voice_messages\": 0, \"documents\": 0, \"links\": 0 },\n"
             + "  \"important_links\": [{ \"title\": \"string\", \"url\": \"string\" }],\n"
             + "  \"most_active_members\": [{ \"name\": \"string\", \"message_count\": 0 }],\n"
-            + "  \"timeline\": [{ \"time\": \"HH:MM\", \"event\": \"string\" }],\n"
+            + "  \"timeline\": [{ \"time\": \"YYYY-MM-DDTHH:MM (copied from the input, never invented)\", \"event\": \"string\" }],\n"
             + "  \"ai_insights\": [\"string\"],\n"
             + "  \"sentiment\": { \"positive_pct\": 0, \"neutral_pct\": 0, \"negative_pct\": 0, \"overall_mood\": \"string\" },\n"
             + "  \"statistics\": { \"messages\": 0, \"participants\": 0, \"links\": 0, \"duration_minutes\": 0 },\n"
-            + "  \"important_quotes\": [{ \"text\": \"string\", \"author\": \"string\", \"time\": \"HH:MM\" }],\n"
+            + "  \"important_quotes\": [{ \"text\": \"string\", \"author\": \"string\", \"time\": \"copied from the input, never invented\" }],\n"
             + "  \"technical_summary\": { \"technologies\": [\"string\"], \"apis\": [\"string\"], \"libraries\": [\"string\"], \"repositories\": [\"string\"], \"errors\": [\"string\"] },\n"
             + "  \"business_summary\": { \"decisions\": [\"string\"], \"deadlines\": [\"string\"], \"risks\": [\"string\"], \"stakeholders\": [\"string\"], \"deliverables\": [\"string\"] }\n"
             + "}";
@@ -141,8 +155,12 @@ public class AiSummary {
 
     /**
      * Builds transcript lines that will leave the device, oldest first, at most {@code limit} messages.
+     *
+     * Each line carries the message's real send time as a full ISO 8601 local timestamp, because a
+     * bare clock time gives the model no year and it will invent one.
      */
     public static List<String> buildTranscript(List<MessageObject> messages, int currentAccount, int limit) {
+        SimpleDateFormat stamp = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm", Locale.US);
         List<String> reversed = new ArrayList<>();
         for (int i = messages.size() - 1; i >= 0 && reversed.size() < limit; i--) {
             MessageObject message = messages.get(i);
@@ -160,7 +178,8 @@ public class AiSummary {
             if (body.length() > MAX_TEXT_CHARS) {
                 body = body.substring(0, MAX_TEXT_CHARS) + "…";
             }
-            reversed.add(senderName(message, currentAccount) + ": " + AiSummaryRedact.redact(body));
+            String when = stamp.format(new Date(message.messageOwner.date * 1000L));
+            reversed.add("[" + when + "] " + senderName(message, currentAccount) + ": " + AiSummaryRedact.redact(body));
         }
         List<String> lines = new ArrayList<>(reversed.size());
         for (int i = reversed.size() - 1; i >= 0; i--) {
@@ -240,13 +259,28 @@ public class AiSummary {
         }
         byte[] payload = payloadJson.toString().getBytes(StandardCharsets.UTF_8);
 
+        // Proves what actually reaches the provider: the stored prompt length, the length that went
+        // into the request, and whether the transcript still contains non-ASCII (Persian) text.
+        // A mismatch between the first two means the prompt was truncated somewhere.
+        if (BuildVars.LOGS_ENABLED) {
+            String stored = prefs.getString(PREF_SYSTEM_PROMPT, null);
+            FileLog.d("AiSummary: prompt stored=" + (stored == null ? DEFAULT_SYSTEM_PROMPT.length() + " (default)" : String.valueOf(stored.length()))
+                    + " sent=" + systemPrompt.length()
+                    + " user_chars=" + userContent.length()
+                    + " user_non_ascii=" + countNonAscii(userContent)
+                    + " payload_bytes=" + payload.length
+                    + " model=" + model);
+        }
+
         HttpURLConnection connection = (HttpURLConnection) new URL(baseUrl + "/chat/completions").openConnection();
         try {
             connection.setRequestMethod("POST");
             connection.setConnectTimeout(TIMEOUT_MS);
             connection.setReadTimeout(TIMEOUT_MS);
             connection.setDoOutput(true);
-            connection.setRequestProperty("Content-Type", "application/json");
+            // Explicit charset: the payload is UTF-8 encoded above, and a provider that assumes
+            // ISO-8859-1 would turn Persian text into mojibake before the model ever sees it.
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             String apiKey = prefs.getString(PREF_API_KEY, "");
             if (!isEmpty(apiKey)) {
                 connection.setRequestProperty("Authorization", "Bearer " + apiKey);
@@ -315,6 +349,17 @@ public class AiSummary {
     private static String trimForError(String body) {
         String trimmed = body.trim();
         return trimmed.length() > 300 ? trimmed.substring(0, 300) : trimmed;
+    }
+
+    /** Non-ASCII count: a Persian transcript that arrives here as 0 has been mangled upstream. */
+    private static int countNonAscii(String text) {
+        int count = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) > 127) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private static boolean isEmpty(CharSequence value) {
