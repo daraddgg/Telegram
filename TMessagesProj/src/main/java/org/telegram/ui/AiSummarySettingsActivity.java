@@ -237,28 +237,35 @@ public class AiSummarySettingsActivity extends BaseFragment {
             super(context);
             setOrientation(VERTICAL);
             setBackgroundColor(getThemedColor(Theme.key_windowBackgroundWhite));
+            // 21dp matches HeaderCell's horizontal padding, so labels line up with section headers.
             setPadding(dp(21), dp(10), dp(21), dp(10));
 
             TextView labelView = new TextView(context);
             labelView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13);
             labelView.setTextColor(getThemedColor(Theme.key_windowBackgroundWhiteBlueHeader));
-            labelView.setText(label);
+            labelView.setText(label + ":");
             addView(labelView, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
             editText = new EditTextBoldCursor(context);
             editText.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
             editText.setTextColor(getThemedColor(Theme.key_windowBackgroundWhiteBlackText));
             editText.setHintTextColor(getThemedColor(Theme.key_windowBackgroundWhiteHintText));
-            editText.setBackgroundDrawable(null);
-            editText.setPadding(0, dp(4), 0, 0);
+            // One fill, one radius, one minimum height for every field, so a short number looks
+            // like the same control as a long URL.
+            editText.setBackground(Theme.createRoundRectDrawable(dp(8), getThemedColor(Theme.key_graySection)));
+            editText.setMinimumHeight(dp(44));
+            editText.setGravity(Gravity.CENTER_VERTICAL);
+            editText.setPadding(dp(12), dp(8), dp(12), dp(8));
             editText.setHint(hint);
             editText.setText(value);
             editText.setSingleLine(!multiline);
             if (multiline) {
-                editText.setMaxLines(4);
+                editText.setMinLines(3);
+                editText.setMaxLines(5);
+                editText.setGravity(Gravity.TOP | Gravity.START);
                 editText.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
             }
-            addView(editText, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+            addView(editText, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, 0, 4, 0, 0));
         }
 
         String text() {
@@ -307,6 +314,9 @@ public class AiSummarySettingsActivity extends BaseFragment {
                     view = new ShadowSectionCell(getContext());
                     break;
             }
+            // Rows added without layout params get LinearLayoutManager's WRAP_CONTENT default,
+            // so each field shrank to its own text width. One place, every row.
+            view.setLayoutParams(new RecyclerView.LayoutParams(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
             return new RecyclerListView.Holder(view);
         }
 

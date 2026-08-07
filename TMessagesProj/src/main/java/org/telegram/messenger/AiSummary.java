@@ -132,6 +132,11 @@ public class AiSummary {
         void onResult(String summary, String error);
     }
 
+    /** Token counter for the streaming path; each SSE delta event is one token. */
+    public interface Progress {
+        void onTokens(int tokens);
+    }
+
     private AiSummary() {
     }
 
@@ -141,6 +146,23 @@ public class AiSummary {
 
     public static boolean isConfigured() {
         return !isEmpty(prefs().getString(PREF_API_KEY, null));
+    }
+
+    public static boolean isStreaming() {
+        return prefs().getBoolean(PREF_STREAMING, false);
+    }
+
+    /**
+     * Token count as a percentage of the configured max_tokens, capped at 99 so the bar never
+     * claims completion before the result is parsed. ponytail: token count is a proxy for real
+     * progress — the model may stop early; upgrade to byte-based only if a provider reports totals.
+     */
+    public static int streamPercent(int tokens) {
+        int max = prefs().getInt(PREF_MAX_TOKENS, DEFAULT_MAX_TOKENS);
+        if (max <= 0) {
+            max = DEFAULT_MAX_TOKENS;
+        }
+        return Math.min(99, tokens * 100 / max);
     }
 
     public static String systemPrompt() {
@@ -215,12 +237,12 @@ public class AiSummary {
      * Runs the request off the main thread and delivers the result on the main thread.
      * Transcripts longer than one request are summarized in chunks and merged, never truncated.
      */
-    public static void request(List<String> transcript, Callback callback) {
+    public static void request(List<String> transcript, Progress progress, Callback callback) {
         Utilities.globalQueue.postRunnable(() -> {
             String summary = null;
             String error = null;
             try {
-                summary = summarize(transcript);
+                summary = summarize(transcript, progress);
             } catch (Exception e) {
                 FileLog.e(e);
                 error = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
@@ -231,19 +253,19 @@ public class AiSummary {
         });
     }
 
-    private static String summarize(List<String> transcript) throws Exception {
+    private static String summarize(List<String> transcript, Progress progress) throws Exception {
         if (transcript.size() <= CHUNK_MESSAGES) {
-            return complete(systemPrompt(), join(transcript, 0, transcript.size()));
+            return complete(systemPrompt(), join(transcript, 0, transcript.size()), progress);
         }
         List<String> partials = new ArrayList<>();
         for (int start = 0; start < transcript.size(); start += CHUNK_MESSAGES) {
             int end = Math.min(start + CHUNK_MESSAGES, transcript.size());
-            partials.add(complete(systemPrompt(), join(transcript, start, end)));
+            partials.add(complete(systemPrompt(), join(transcript, start, end), progress));
         }
-        return complete(systemPrompt() + "\n\n" + MERGE_INSTRUCTION, join(partials, 0, partials.size()));
+        return complete(systemPrompt() + "\n\n" + MERGE_INSTRUCTION, join(partials, 0, partials.size()), progress);
     }
 
-    private static String complete(String systemPrompt, String userContent) throws Exception {
+    private static String complete(String systemPrompt, String userContent, Progress progress) throws Exception {
         SharedPreferences prefs = prefs();
         String baseUrl = prefs.getString(PREF_BASE_URL, DEFAULT_BASE_URL);
         String model = prefs.getString(PREF_MODEL, DEFAULT_MODEL);
@@ -257,6 +279,7 @@ public class AiSummary {
             baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
         }
 
+        boolean stream = progress != null && prefs.getBoolean(PREF_STREAMING, false);
         JSONArray messages = new JSONArray()
                 .put(new JSONObject().put("role", "system").put("content", systemPrompt))
                 .put(new JSONObject().put("role", "user").put("content", userContent));
@@ -265,6 +288,9 @@ public class AiSummary {
                 .put("temperature", prefs.getFloat(PREF_TEMPERATURE, DEFAULT_TEMPERATURE))
                 .put("top_p", prefs.getFloat(PREF_TOP_P, DEFAULT_TOP_P))
                 .put("messages", messages);
+        if (stream) {
+            payloadJson.put("stream", true);
+        }
         int maxTokens = prefs.getInt(PREF_MAX_TOKENS, DEFAULT_MAX_TOKENS);
         if (maxTokens > 0) {
             payloadJson.put("max_tokens", maxTokens);
@@ -281,6 +307,7 @@ public class AiSummary {
                     + " user_chars=" + userContent.length()
                     + " user_non_ascii=" + countNonAscii(userContent)
                     + " payload_bytes=" + payload.length
+                    + " stream=" + stream
                     + " model=" + model);
         }
 
@@ -293,6 +320,9 @@ public class AiSummary {
             // Explicit charset: the payload is UTF-8 encoded above, and a provider that assumes
             // ISO-8859-1 would turn Persian text into mojibake before the model ever sees it.
             connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            if (stream) {
+                connection.setRequestProperty("Accept", "text/event-stream");
+            }
             String apiKey = prefs.getString(PREF_API_KEY, "");
             if (!isEmpty(apiKey)) {
                 connection.setRequestProperty("Authorization", "Bearer " + apiKey);
@@ -302,13 +332,14 @@ public class AiSummary {
                 out.write(payload);
             }
             int code = connection.getResponseCode();
-            String body = readAll(code >= 400 ? connection.getErrorStream() : connection.getInputStream());
             if (code >= 400) {
-                throw new Exception("HTTP " + code + ": " + trimForError(body));
+                throw new Exception("HTTP " + code + ": " + trimForError(readAll(connection.getErrorStream())));
             }
-            String content = new JSONObject(body)
-                    .getJSONArray("choices").getJSONObject(0)
-                    .getJSONObject("message").getString("content").trim();
+            String content = stream
+                    ? readStream(connection.getInputStream(), progress)
+                    : new JSONObject(readAll(connection.getInputStream()))
+                            .getJSONArray("choices").getJSONObject(0)
+                            .getJSONObject("message").getString("content").trim();
             if (content.isEmpty()) {
                 throw new Exception("empty response");
             }
@@ -342,6 +373,57 @@ public class AiSummary {
             builder.append(parts.get(i)).append('\n');
         }
         return builder.toString();
+    }
+
+    /**
+     * Consumes an SSE stream line by line, reporting a running token count as it goes.
+     *
+     * The schema output is one JSON object, so showing partial text would put `{"executive_su` on
+     * screen. Only the count is surfaced; the parsed object is still rendered once complete.
+     */
+    private static String readStream(InputStream stream, Progress progress) throws Exception {
+        StringBuilder content = new StringBuilder();
+        int tokens = 0;
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String delta = streamDelta(line);
+                if (delta == null) {
+                    continue;
+                }
+                content.append(delta);
+                tokens++;
+                final int count = tokens;
+                AndroidUtilities.runOnUIThread(() -> progress.onTokens(count));
+            }
+        }
+        return content.toString().trim();
+    }
+
+    /** Content of one SSE line, or null when the line carries no delta text. */
+    static String streamDelta(String line) {
+        if (line == null || !line.startsWith("data:")) {
+            return null;
+        }
+        String data = line.substring(5).trim();
+        if (data.isEmpty() || "[DONE]".equals(data)) {
+            return null;
+        }
+        try {
+            JSONArray choices = new JSONObject(data).optJSONArray("choices");
+            if (choices == null || choices.length() == 0) {
+                return null;
+            }
+            JSONObject delta = choices.getJSONObject(0).optJSONObject("delta");
+            if (delta == null) {
+                return null;
+            }
+            String text = delta.optString("content", "");
+            return text.isEmpty() ? null : text;
+        } catch (Exception e) {
+            // A malformed or keep-alive line must not abort a stream that is otherwise fine.
+            return null;
+        }
     }
 
     private static String readAll(InputStream stream) throws Exception {

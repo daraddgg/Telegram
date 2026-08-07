@@ -11251,9 +11251,19 @@ public class ChatActivity extends BaseFragment implements
             BulletinFactory.of(this).createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.AiSummaryEmpty)).show();
             return;
         }
-        AlertDialog progress = new AlertDialog(getParentActivity(), AlertDialog.ALERT_TYPE_SPINNER, themeDelegate);
+        final boolean streaming = AiSummary.isStreaming();
+        AlertDialog progress = new AlertDialog(getParentActivity(),
+                streaming ? AlertDialog.ALERT_TYPE_LOADING : AlertDialog.ALERT_TYPE_SPINNER, themeDelegate);
+        if (streaming) {
+            // Title and message must exist before show(): the dialog builds its views once.
+            progress.setTitle(LocaleController.getString(R.string.AiSummary));
+            progress.setMessage(LocaleController.formatString(R.string.AiSummaryStreamingTokens, 0));
+        }
         progress.show();
-        AiSummary.request(transcript, (summary, error) -> {
+        AiSummary.request(transcript, tokens -> {
+            progress.setMessage(LocaleController.formatString(R.string.AiSummaryStreamingTokens, tokens));
+            progress.setProgress(AiSummary.streamPercent(tokens));
+        }, (summary, error) -> {
             progress.dismiss();
             if (getParentActivity() == null) {
                 return;
