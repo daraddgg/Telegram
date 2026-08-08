@@ -54,23 +54,27 @@ public class AiSummary {
     public static final String DEFAULT_SYSTEM_PROMPT = "You are AI Summary Pro, a conversation-intelligence engine that converts Telegram\n"
             + "group chat messages into structured, factual summaries.\n"
             + "\n"
+            + "LANGUAGE IS NON-NEGOTIABLE: detect the dominant language of the conversation from\n"
+            + "the actual message text provided. Every single string value in your JSON output —\n"
+            + "in every field, from every chunk, in every merge step — must be in that language.\n"
+            + "Check this before finalizing your response. Do not let one field slip into English\n"
+            + "while others are correct. Only JSON key names stay English. A word that was already\n"
+            + "in another language in the source messages may stay as it was. Never mix in a word\n"
+            + "or phrase from any other language; if unsure of a word, describe it plainly in the\n"
+            + "dominant language instead of switching languages mid-sentence.\n"
+            + "\n"
             + "RULES:\n"
             + "1. Ground everything in the provided messages only. Never invent decisions, tasks,\n"
             + "   names, links, quotes, or events. If a section has no supporting content, return\n"
             + "   it empty — do not fabricate placeholder content.\n"
             + "2. Attribute action items to a person only when the assignment is clear from\n"
             + "   context. Otherwise use \"Unknown Owner\".\n"
-            + "3. LANGUAGE — Detect the dominant language of the conversation from the actual message\n"
-            + "   text provided. Write ALL prose string values in every field (summaries,\n"
-            + "   hot topics, insights, the text around quotes, etc.) in that exact\n"
-            + "   language. If the dominant language is Persian, every string value must\n"
-            + "   be in Persian except: JSON key names, and any word/phrase that was\n"
-            + "   already in a different language in the source messages. Never default\n"
-            + "   to English regardless of any other instruction or example in this\n"
-            + "   prompt. Never mix in a word or phrase from a language other than the\n"
-            + "   dominant conversation language and English JSON keys. If unsure of a\n"
-            + "   word, use a plain description in the dominant language instead of\n"
-            + "   switching languages mid-sentence.\n"
+            + "3. technical_summary and business_summary must only contain facts explicitly stated\n"
+            + "   in the messages. Do not infer a person's role (e.g. \"tester\", \"stakeholder\")\n"
+            + "   or a risk/status unless someone in the chat literally said it. If the\n"
+            + "   conversation is casual and provides no real technical/business substance, leave\n"
+            + "   these sections mostly or entirely empty rather than manufacturing\n"
+            + "   professional-sounding framing.\n"
             + "4. Anything already marked [REDACTED] stays redacted. Never reproduce a credential,\n"
             + "   API key, token, card number or password, even inside quotes or code blocks.\n"
             + "5. Quotes: at most 5, each under 25 words, each with speaker and time. Never alter\n"
@@ -181,29 +185,26 @@ public class AiSummary {
     /**
      * Builds transcript lines that will leave the device, oldest first, at most {@code limit} messages.
      *
-     * Each line carries the message's real send time as a full ISO 8601 local timestamp, because a
-     * bare clock time gives the model no year and it will invent one.
+     * Input comes newest-first from the database and is reversed here. Each line carries the send
+     * time as a full ISO 8601 local timestamp, because a bare clock time gives the model no year
+     * and it will invent one.
      */
-    public static List<String> buildTranscript(List<MessageObject> messages, int currentAccount, int limit) {
+    public static List<String> buildTranscript(List<TLRPC.Message> messages, int currentAccount, int limit) {
         SimpleDateFormat stamp = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm", Locale.US);
         List<String> reversed = new ArrayList<>();
-        for (int i = messages.size() - 1; i >= 0 && reversed.size() < limit; i--) {
-            MessageObject message = messages.get(i);
-            if (message == null || message.messageOwner == null || message.messageOwner.action != null) {
+        for (int i = 0; i < messages.size() && reversed.size() < limit; i++) {
+            TLRPC.Message message = messages.get(i);
+            if (message == null || message.action != null || message.message == null) {
                 continue;
             }
-            CharSequence text = message.messageText;
-            if (text == null || text.length() == 0) {
-                continue;
-            }
-            String body = text.toString().replace('\n', ' ').trim();
+            String body = message.message.replace('\n', ' ').trim();
             if (body.isEmpty()) {
                 continue;
             }
             if (body.length() > MAX_TEXT_CHARS) {
                 body = body.substring(0, MAX_TEXT_CHARS) + "…";
             }
-            String when = stamp.format(new Date(message.messageOwner.date * 1000L));
+            String when = stamp.format(new Date(message.date * 1000L));
             reversed.add("[" + when + "] " + senderName(message, currentAccount) + ": " + AiSummaryRedact.redact(body));
         }
         List<String> lines = new ArrayList<>(reversed.size());
@@ -213,16 +214,16 @@ public class AiSummary {
         return lines;
     }
 
-    private static String senderName(MessageObject message, int currentAccount) {
-        long fromId = message.getFromChatId();
+    private static String senderName(TLRPC.Message message, int currentAccount) {
+        long fromId = MessageObject.getFromChatId(message);
         // Private chats omit from_id in the TL message: the sender is only derivable from the out
         // flag plus the dialog peer. Without this both directions resolve to id 0 and every line
         // gets the same label, so the model sees a monologue and the other party's messages
         // vanish from the summary.
         if (fromId == 0) {
-            fromId = message.isOutOwner()
+            fromId = message.out
                     ? UserConfig.getInstance(currentAccount).getClientUserId()
-                    : message.getDialogId();
+                    : MessageObject.getDialogId(message);
         }
         if (fromId > 0) {
             TLRPC.User user = MessagesController.getInstance(currentAccount).getUser(fromId);

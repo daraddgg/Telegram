@@ -11246,11 +11246,26 @@ public class ChatActivity extends BaseFragment implements
     }
 
     private void runAiSummary(int count) {
-        List<String> transcript = AiSummary.buildTranscript(messages, currentAccount, count);
-        if (transcript.isEmpty()) {
-            BulletinFactory.of(this).createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.AiSummaryEmpty)).show();
-            return;
-        }
+        AlertDialog loading = new AlertDialog(getParentActivity(), AlertDialog.ALERT_TYPE_SPINNER, themeDelegate);
+        loading.show();
+        getMessagesStorage().getLastMessagesForSummary(getDialogId(), count, stored -> {
+            loading.dismiss();
+            if (getParentActivity() == null) {
+                return;
+            }
+            List<String> transcript = AiSummary.buildTranscript(stored, currentAccount, count);
+            if (BuildVars.LOGS_ENABLED) {
+                FileLog.d("AiSummary: requested=" + count + " db_rows=" + stored.size() + " transcript=" + transcript.size());
+            }
+            if (transcript.isEmpty()) {
+                BulletinFactory.of(this).createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.AiSummaryEmpty)).show();
+                return;
+            }
+            sendAiSummary(transcript);
+        });
+    }
+
+    private void sendAiSummary(List<String> transcript) {
         final boolean streaming = AiSummary.isStreaming();
         AlertDialog progress = new AlertDialog(getParentActivity(),
                 streaming ? AlertDialog.ALERT_TYPE_LOADING : AlertDialog.ALERT_TYPE_SPINNER, themeDelegate);

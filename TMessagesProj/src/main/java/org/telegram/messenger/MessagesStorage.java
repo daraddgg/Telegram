@@ -8850,6 +8850,46 @@ public class MessagesStorage extends BaseController {
         });
     }
 
+    /**
+     * Reads the last {@code limit} text messages of a dialog straight from the local database.
+     *
+     * ChatActivity's in-memory {@code messages} list only holds what the user scrolled through
+     * (a few dozen rows), so a range picker fed from it silently capped every choice at the same
+     * small window. Going to SQLite is the only way "last 1000" means 1000.
+     *
+     * ponytail: local cache only — messages never downloaded to this device are not fetched from
+     * the server. Add a server backfill if a range routinely exceeds what is cached.
+     */
+    public void getLastMessagesForSummary(long dialogId, int limit, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+        storageQueue.postRunnable(() -> {
+            ArrayList<TLRPC.Message> result = new ArrayList<>();
+            SQLiteCursor cursor = null;
+            try {
+                cursor = database.queryFinalized(String.format(Locale.US,
+                        "SELECT data FROM messages_v2 WHERE uid = %d ORDER BY date DESC, mid DESC LIMIT %d", dialogId, limit));
+                while (cursor.next()) {
+                    NativeByteBuffer data = cursor.byteBufferValue(0);
+                    if (data == null) {
+                        continue;
+                    }
+                    TLRPC.Message message = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
+                    if (message != null) {
+                        message.readAttachPath(data, getUserConfig().clientUserId);
+                        result.add(message);
+                    }
+                    data.reuse();
+                }
+            } catch (Exception e) {
+                checkSQLException(e);
+            } finally {
+                if (cursor != null) {
+                    cursor.dispose();
+                }
+            }
+            AndroidUtilities.runOnUIThread(() -> callback.run(result));
+        });
+    }
+
     public Runnable getMessagesInternal(long dialogId, long mergeDialogId, int count, int max_id, int offset_date, int minDate, int classGuid, int load_type, int mode, long threadMessageId, int loadIndex, boolean processMessages, boolean isTopic, Timer loaderLogger) {
         TLRPC.TL_messages_messages res = new TLRPC.TL_messages_messages();
         long currentUserId = getUserConfig().clientUserId;
