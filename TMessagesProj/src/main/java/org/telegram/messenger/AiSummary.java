@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Pattern;
 
 /**
  * Summarizes a chat transcript through an OpenAI-compatible chat/completions endpoint.
@@ -42,7 +43,7 @@ public class AiSummary {
     public static final String DEFAULT_BASE_URL = "https://api.openai.com/v1";
     public static final String DEFAULT_MODEL = "gpt-4o-mini";
     public static final float DEFAULT_TEMPERATURE = 0.2f;
-    public static final int DEFAULT_MAX_TOKENS = 4096;
+    public static final int DEFAULT_MAX_TOKENS = 8192;
     public static final float DEFAULT_TOP_P = 1f;
     public static final int DEFAULT_RANGE = 100;
     public static final int MIN_RANGE = 25;
@@ -51,6 +52,8 @@ public class AiSummary {
     private static final int CHUNK_MESSAGES = 250;
     private static final int TIMEOUT_MS = 90000;
     private static final int MAX_TEXT_CHARS = 400;
+    private static final Pattern REASONING_TAG =
+            Pattern.compile("(?is)<(think|thinking|reasoning)>.*?</\\1>");
 
     public static final String DEFAULT_SYSTEM_PROMPT = "You are AI Summary Pro, a conversation-intelligence engine that converts Telegram\n"
             + "group chat messages into structured, factual summaries.\n"
@@ -382,6 +385,48 @@ public class AiSummary {
         return complete(systemPrompt() + "\n\n" + MERGE_INSTRUCTION, join(partials, 0, partials.size()), progress);
     }
 
+    /**
+     * Drops a reasoning preamble that arrived inside content instead of its own field.
+     *
+     * Handles both the tagged form (`<think>…</think>`, `<reasoning>…</reasoning>`) and the
+     * untagged form, where the model narrates first and the object starts later in the text.
+     */
+    static String stripReasoning(String content) {
+        if (content == null) {
+            return "";
+        }
+        String text = REASONING_TAG.matcher(content).replaceAll("").trim();
+        // An unclosed tag means the budget ran out mid-thought: nothing usable follows.
+        int open = text.indexOf("<think");
+        if (open >= 0) {
+            text = text.substring(0, open).trim();
+        }
+        int brace = text.indexOf('{');
+        int end = text.lastIndexOf('}');
+        if (brace >= 0 && end > brace) {
+            text = text.substring(brace, end + 1);
+        }
+        return text.trim();
+    }
+
+    /** Rejects anything that is not a complete JSON object: raw prose must never reach the user. */
+    private static String requireJson(String content) throws Exception {
+        String text = stripReasoning(content);
+        if (!text.startsWith("{") || !text.endsWith("}")) {
+            throw new Exception("bad response: model did not return JSON (reasoning leak or truncation)");
+        }
+        try {
+            new JSONObject(text);
+        } catch (Exception e) {
+            throw new Exception("bad response: incomplete JSON, try again or raise Max Tokens");
+        }
+        return text;
+    }
+
+    private static String trimForLog(String body) {
+        return body.length() > 2000 ? body.substring(0, 2000) + "…" : body;
+    }
+
     private static String complete(String systemPrompt, String userContent, Progress progress) throws Exception {
         SharedPreferences prefs = prefs();
         String baseUrl = prefs.getString(PREF_BASE_URL, DEFAULT_BASE_URL);
@@ -408,6 +453,11 @@ public class AiSummary {
         if (stream) {
             payloadJson.put("stream", true);
         }
+        // Reasoning models spend the whole token budget on a chain of thought and either leak it
+        // as the answer or run out of room mid-JSON. OpenRouter honours this; providers that
+        // don't recognise it ignore an unknown field.
+        payloadJson.put("reasoning", new JSONObject().put("exclude", true));
+        payloadJson.put("include_reasoning", false);
         int maxTokens = prefs.getInt(PREF_MAX_TOKENS, DEFAULT_MAX_TOKENS);
         if (maxTokens > 0) {
             payloadJson.put("max_tokens", maxTokens);
@@ -452,11 +502,23 @@ public class AiSummary {
             if (code >= 400) {
                 throw new Exception("HTTP " + code + ": " + trimForError(readAll(connection.getErrorStream())));
             }
-            String content = stream
-                    ? readStream(connection.getInputStream(), progress)
-                    : new JSONObject(readAll(connection.getInputStream()))
-                            .getJSONArray("choices").getJSONObject(0)
-                            .getJSONObject("message").getString("content").trim();
+            String content;
+            if (stream) {
+                content = readStream(connection.getInputStream(), progress);
+            } else {
+                String body = readAll(connection.getInputStream());
+                if (BuildVars.LOGS_ENABLED) {
+                    // Whole response, not just the field we parse: shows whether reasoning came
+                    // back in its own key, inside content, and what finish_reason really was.
+                    FileLog.d("AiSummary: raw response " + trimForLog(body));
+                }
+                JSONObject choice = new JSONObject(body).getJSONArray("choices").getJSONObject(0);
+                if ("length".equals(choice.optString("finish_reason"))) {
+                    throw new Exception("truncated: response hit max_tokens, raise it and retry");
+                }
+                content = choice.getJSONObject("message").getString("content");
+            }
+            content = requireJson(content);
             if (content.isEmpty()) {
                 throw new Exception("empty response");
             }
@@ -501,9 +563,11 @@ public class AiSummary {
     private static String readStream(InputStream stream, Progress progress) throws Exception {
         StringBuilder content = new StringBuilder();
         int tokens = 0;
+        boolean truncated = false;
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
+                truncated |= line.contains("\"finish_reason\":\"length\"") || line.contains("\"finish_reason\": \"length\"");
                 String delta = streamDelta(line);
                 if (delta == null) {
                     continue;
@@ -513,6 +577,9 @@ public class AiSummary {
                 final int count = tokens;
                 AndroidUtilities.runOnUIThread(() -> progress.onTokens(count));
             }
+        }
+        if (truncated) {
+            throw new Exception("truncated: response hit max_tokens, raise it and retry");
         }
         return content.toString().trim();
     }

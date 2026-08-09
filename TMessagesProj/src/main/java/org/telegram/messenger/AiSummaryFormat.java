@@ -35,10 +35,10 @@ public class AiSummaryFormat {
     private AiSummaryFormat() {
     }
 
-    /** Returns display text, or the input unchanged when it is not the expected JSON object. */
+    /** Returns display text, or "" when there is nothing renderable. Never returns raw model text. */
     public static String format(String raw) {
         if (raw == null || raw.trim().isEmpty()) {
-            return raw;
+            return "";
         }
         String body = raw.trim();
         Matcher fence = FENCE.matcher(body);
@@ -50,10 +50,10 @@ public class AiSummaryFormat {
             root = new JSONObject(body);
         } catch (Exception e) {
             // A model that adds a sentence before or after the object still produced a usable
-            // summary; falling back to raw text is what puts braces on the user's screen.
+            // summary; showing the raw text is what puts braces and reasoning on the screen.
             root = objectFrom(body);
             if (root == null) {
-                return raw.trim();
+                return "";
             }
         }
 
@@ -86,7 +86,9 @@ public class AiSummaryFormat {
         if (linkSection != null) {
             text = text.isEmpty() ? linkSection : text + "\n\n" + linkSection;
         }
-        return text.isEmpty() ? raw.trim() : text;
+        // Valid JSON with nothing in it is still nothing to show — never fall back to the raw
+        // object, an empty result is the caller's cue to say so in its own words.
+        return text;
     }
 
     private static String renderSection(String key, Object value) {

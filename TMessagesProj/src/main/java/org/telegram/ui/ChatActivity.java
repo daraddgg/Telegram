@@ -11308,6 +11308,16 @@ public class ChatActivity extends BaseFragment implements
                 return;
             }
             final String text = AiSummaryFormat.format(summary);
+            if (text.isEmpty()) {
+                // Unrenderable output is a failed generation, not something to dump on screen.
+                new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                        .setTitle(LocaleController.getString(R.string.AiSummary))
+                        .setMessage(LocaleController.getString(R.string.AiSummaryBadResponse))
+                        .setPositiveButton(LocaleController.getString(R.string.OK), null)
+                        .setNeutralButton(LocaleController.getString(R.string.Settings), (d, w) -> presentFragment(new AiSummarySettingsActivity()))
+                        .show();
+                return;
+            }
             new AlertDialog.Builder(getParentActivity(), themeDelegate)
                     .setTitle(LocaleController.getString(R.string.AiSummary))
                     .setMessage(text)

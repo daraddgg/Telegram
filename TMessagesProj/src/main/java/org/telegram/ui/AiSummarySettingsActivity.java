@@ -107,7 +107,7 @@ public class AiSummarySettingsActivity extends BaseFragment {
                 "0.2", floatText(prefs.getFloat(AiSummary.PREF_TEMPERATURE, AiSummary.DEFAULT_TEMPERATURE)), false);
         temperatureCell.editText.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         maxTokensCell = new LabeledEditCell(context, LocaleController.getString(R.string.AiSummaryMaxTokens),
-                "4096", String.valueOf(prefs.getInt(AiSummary.PREF_MAX_TOKENS, AiSummary.DEFAULT_MAX_TOKENS)), false);
+                "8192", String.valueOf(prefs.getInt(AiSummary.PREF_MAX_TOKENS, AiSummary.DEFAULT_MAX_TOKENS)), false);
         maxTokensCell.editText.setInputType(InputType.TYPE_CLASS_NUMBER);
         topPCell = new LabeledEditCell(context, LocaleController.getString(R.string.AiSummaryTopP),
                 "1", floatText(prefs.getFloat(AiSummary.PREF_TOP_P, AiSummary.DEFAULT_TOP_P)), false);

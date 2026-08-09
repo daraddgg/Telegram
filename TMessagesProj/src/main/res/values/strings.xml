@@ -1394,6 +1394,7 @@
     <string name="TranslateMessage">Translate</string>
     <string name="AiSummary">AI Summary</string>
     <string name="AiSummaryEmpty">No text messages loaded to summarize.</string>
+    <string name="AiSummaryBadResponse">The model returned an unusable response. Try again, raise Max Tokens, or pick a model without reasoning output.</string>
     <string name="AiSummaryPrivacyNotice">Loaded messages from this chat are sent to the AI provider you configure below. Credentials found in the text are redacted on-device first.</string>
     <string name="AiSummaryProvider">Provider</string>
     <string name="AiSummarySampling">Sampling</string>
