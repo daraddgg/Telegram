@@ -11248,21 +11248,36 @@ public class ChatActivity extends BaseFragment implements
     private void runAiSummary(int count) {
         AlertDialog loading = new AlertDialog(getParentActivity(), AlertDialog.ALERT_TYPE_SPINNER, themeDelegate);
         loading.show();
-        getMessagesStorage().getLastMessagesForSummary(getDialogId(), count, stored -> {
-            loading.dismiss();
+        getMessagesStorage().getLastMessagesForSummary(getDialogId(), count, cached -> {
             if (getParentActivity() == null) {
+                loading.dismiss();
                 return;
             }
-            List<String> transcript = AiSummary.buildTranscript(stored, currentAccount, count);
-            if (BuildVars.LOGS_ENABLED) {
-                FileLog.d("AiSummary: requested=" + count + " db_rows=" + stored.size() + " transcript=" + transcript.size());
+            // The cache is only a fast path: if it already holds the whole range there is no
+            // reason to hit the network, otherwise the server is the only source that has it.
+            if (cached.size() >= count) {
+                deliverAiSummary(loading, cached, count);
+            } else {
+                AiSummary.fetchHistory(currentAccount, getDialogId(), count,
+                        fetched -> deliverAiSummary(loading, fetched.size() >= cached.size() ? fetched : cached, count));
             }
-            if (transcript.isEmpty()) {
-                BulletinFactory.of(this).createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.AiSummaryEmpty)).show();
-                return;
-            }
-            sendAiSummary(transcript);
         });
+    }
+
+    private void deliverAiSummary(AlertDialog loading, java.util.ArrayList<TLRPC.Message> stored, int count) {
+        loading.dismiss();
+        if (getParentActivity() == null) {
+            return;
+        }
+        List<String> transcript = AiSummary.buildTranscript(stored, currentAccount, count);
+        if (BuildVars.LOGS_ENABLED) {
+            FileLog.d("AiSummary: requested=" + count + " rows=" + stored.size() + " transcript=" + transcript.size());
+        }
+        if (transcript.isEmpty()) {
+            BulletinFactory.of(this).createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.AiSummaryEmpty)).show();
+            return;
+        }
+        sendAiSummary(transcript);
     }
 
     private void sendAiSummary(List<String> transcript) {

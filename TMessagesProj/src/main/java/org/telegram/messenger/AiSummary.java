@@ -4,6 +4,7 @@ import android.content.SharedPreferences;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.tgnet.TLRPC;
 
 import java.io.BufferedReader;
@@ -54,14 +55,14 @@ public class AiSummary {
     public static final String DEFAULT_SYSTEM_PROMPT = "You are AI Summary Pro, a conversation-intelligence engine that converts Telegram\n"
             + "group chat messages into structured, factual summaries.\n"
             + "\n"
-            + "LANGUAGE IS NON-NEGOTIABLE: detect the dominant language of the conversation from\n"
-            + "the actual message text provided. Every single string value in your JSON output —\n"
-            + "in every field, from every chunk, in every merge step — must be in that language.\n"
-            + "Check this before finalizing your response. Do not let one field slip into English\n"
-            + "while others are correct. Only JSON key names stay English. A word that was already\n"
-            + "in another language in the source messages may stay as it was. Never mix in a word\n"
-            + "or phrase from any other language; if unsure of a word, describe it plainly in the\n"
-            + "dominant language instead of switching languages mid-sentence.\n"
+            + "LANGUAGE IS NON-NEGOTIABLE: every single string value in your JSON output —\n"
+            + "in every field, from every chunk, in every merge step — must be in the\n"
+            + "dominant language of the conversation, using only characters/words that\n"
+            + "belong to that language (plus English JSON keys). Never insert a word,\n"
+            + "character, or script from any third language, even accidentally. Check\n"
+            + "this before finalizing your response. Detect that dominant language from the\n"
+            + "actual message text provided; never default to English. A word that was already\n"
+            + "in another language in the source messages may stay as it was.\n"
             + "\n"
             + "RULES:\n"
             + "1. Ground everything in the provided messages only. Never invent decisions, tasks,\n"
@@ -69,25 +70,34 @@ public class AiSummary {
             + "   it empty — do not fabricate placeholder content.\n"
             + "2. Attribute action items to a person only when the assignment is clear from\n"
             + "   context. Otherwise use \"Unknown Owner\".\n"
-            + "3. technical_summary and business_summary must only contain facts explicitly stated\n"
-            + "   in the messages. Do not infer a person's role (e.g. \"tester\", \"stakeholder\")\n"
-            + "   or a risk/status unless someone in the chat literally said it. If the\n"
-            + "   conversation is casual and provides no real technical/business substance, leave\n"
-            + "   these sections mostly or entirely empty rather than manufacturing\n"
-            + "   professional-sounding framing.\n"
-            + "4. Anything already marked [REDACTED] stays redacted. Never reproduce a credential,\n"
+            + "3. technical_summary and business_summary must only contain facts explicitly\n"
+            + "   stated in the messages. Do not infer a person's role (e.g. \"tester\",\n"
+            + "   \"target user\", \"stakeholder\") or a risk/status unless someone in the chat\n"
+            + "   literally said it. If the conversation is casual and provides no real\n"
+            + "   technical/business substance, leave these sections mostly or entirely\n"
+            + "   empty rather than manufacturing professional-sounding framing.\n"
+            + "4. NEVER diagnose, label, or speculate about anyone's mental health, emotional\n"
+            + "   state, or personal wellbeing. Do not write that someone seems depressed,\n"
+            + "   unmotivated, anxious, lonely, or needs support, and never suggest they get\n"
+            + "   help — not in ai_insights, not in sentiment.overall_mood, not anywhere. A\n"
+            + "   message like \"nothing feels good\" is a statement in the chat, not a\n"
+            + "   condition to assess. sentiment describes the tone of the CONVERSATION as a\n"
+            + "   whole, never the psychology of a participant. If a topic is personal or\n"
+            + "   sensitive, report only what was literally said, or leave the field empty.\n"
+            + "5. Anything already marked [REDACTED] stays redacted. Never reproduce a credential,\n"
             + "   API key, token, card number or password, even inside quotes or code blocks.\n"
-            + "5. Quotes: at most 5, each under 25 words, each with speaker and time. Never alter\n"
+            + "6. Quotes: at most 5, each under 25 words, each with speaker and time. Never alter\n"
             + "   the wording.\n"
-            + "6. Sentiment percentages must sum to 100.\n"
-            + "7. If the range contains zero usable messages, return the schema with empty fields\n"
+            + "7. Sentiment percentages must sum to 100.\n"
+            + "8. Leave statistics at 0 — the app fills in the real counts itself.\n"
+            + "9. If the range contains zero usable messages, return the schema with empty fields\n"
             + "   and set meta.note to explain why.\n"
-            + "8. DATES — For any date or timestamp you output (timeline entries, quote timestamps,\n"
+            + "10. DATES — For any date or timestamp you output (timeline entries, quote timestamps,\n"
             + "   etc.), use ONLY the exact date/time values provided with each message in\n"
             + "   the input. Never infer, assume, or default to a year or date from your own\n"
             + "   training data or general knowledge — if a message's date isn't explicitly\n"
             + "   provided in the input, omit the date rather than guessing one.\n"
-            + "9. Output ONLY valid JSON matching the schema below. No markdown fences, no\n"
+            + "11. Output ONLY valid JSON matching the schema below. No markdown fences, no\n"
             + "   commentary, no preamble or postamble.\n"
             + "\n"
             + "SIGNIFICANCE FILTER — apply before populating any section:\n"
@@ -248,10 +258,116 @@ public class AiSummary {
                 FileLog.e(e);
                 error = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             }
-            final String resultSummary = summary;
+            final String resultSummary = summary == null ? null : applyStatistics(summary, transcript);
             final String resultError = error;
             AndroidUtilities.runOnUIThread(() -> callback.onResult(resultSummary, resultError));
         });
+    }
+
+    /**
+     * Fetches the last {@code limit} messages of a dialog from the server, newest first.
+     *
+     * The local cache only holds what was already downloaded — roughly the last few dozen
+     * messages — so reading it made every range return the same rows and the same
+     * duration_minutes. messages.getHistory caps a page at 100, hence the paging loop.
+     *
+     * ponytail: sequential pages, one in flight at a time. 1000 messages is 10 round trips;
+     * parallelise only if that ever feels slow.
+     */
+    public static void fetchHistory(int currentAccount, long dialogId, int limit, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+        fetchPage(currentAccount, dialogId, limit, 0, new ArrayList<>(), callback);
+    }
+
+    private static void fetchPage(int currentAccount, long dialogId, int limit, int offsetId,
+                                  ArrayList<TLRPC.Message> collected, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+        TLRPC.TL_messages_getHistory req = new TLRPC.TL_messages_getHistory();
+        req.peer = MessagesController.getInstance(currentAccount).getInputPeer(dialogId);
+        req.offset_id = offsetId;
+        req.limit = Math.min(100, limit - collected.size());
+        if (req.peer == null || req.limit <= 0) {
+            AndroidUtilities.runOnUIThread(() -> callback.run(collected));
+            return;
+        }
+        ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
+            if (!(response instanceof TLRPC.messages_Messages)) {
+                callback.run(collected);
+                return;
+            }
+            TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
+            // Sender names are resolved from the controller's caches, so the page's users and
+            // chats have to be registered before the transcript is built.
+            MessagesController.getInstance(currentAccount).putUsers(res.users, false);
+            MessagesController.getInstance(currentAccount).putChats(res.chats, false);
+            collected.addAll(res.messages);
+            if (res.messages.isEmpty() || collected.size() >= limit) {
+                callback.run(collected);
+            } else {
+                fetchPage(currentAccount, dialogId, limit, res.messages.get(res.messages.size() - 1).id, collected, callback);
+            }
+        }));
+    }
+
+    /**
+     * Overwrites the model's statistics block with counts computed from the transcript itself.
+     *
+     * The model guessed these numbers, which is why three different ranges reported nearly the
+     * same duration_minutes. The transcript is the ground truth: it is exactly what was sent.
+     */
+    static String applyStatistics(String summary, List<String> transcript) {
+        try {
+            String body = summary.trim();
+            int start = body.indexOf('{');
+            int end = body.lastIndexOf('}');
+            if (start < 0 || end <= start) {
+                return summary;
+            }
+            JSONObject root = new JSONObject(body.substring(start, end + 1));
+            JSONObject stats = root.optJSONObject("statistics");
+            if (stats == null) {
+                stats = new JSONObject();
+                root.put("statistics", stats);
+            }
+            java.util.Set<String> senders = new java.util.LinkedHashSet<>();
+            long first = 0;
+            long last = 0;
+            for (String line : transcript) {
+                // Lines are "[yyyy-MM-dd'T'HH:mm] Sender: text" — built by buildTranscript above.
+                if (!line.startsWith("[")) {
+                    continue;
+                }
+                int close = line.indexOf(']');
+                if (close < 0) {
+                    continue;
+                }
+                long when = parseStamp(line.substring(1, close));
+                if (when > 0) {
+                    if (first == 0) {
+                        first = when;
+                    }
+                    last = when;
+                }
+                int colon = line.indexOf(": ", close);
+                if (colon > close) {
+                    senders.add(line.substring(close + 2, colon));
+                }
+            }
+            stats.put("messages", transcript.size());
+            stats.put("participants", senders.size());
+            stats.put("duration_minutes", first > 0 && last > first ? (last - first) / 60000L : 0);
+            return root.toString();
+        } catch (Exception e) {
+            // Never lose a good summary over a statistics rewrite.
+            FileLog.e(e);
+            return summary;
+        }
+    }
+
+    private static long parseStamp(String value) {
+        try {
+            return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm", Locale.US).parse(value).getTime();
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     private static String summarize(List<String> transcript, Progress progress) throws Exception {
