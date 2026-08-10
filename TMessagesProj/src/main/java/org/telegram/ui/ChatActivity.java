@@ -11253,25 +11253,27 @@ public class ChatActivity extends BaseFragment implements
                 loading.dismiss();
                 return;
             }
-            // The cache is only a fast path: if it already holds the whole range there is no
-            // reason to hit the network, otherwise the server is the only source that has it.
-            if (cached.size() >= count) {
-                deliverAiSummary(loading, cached, count);
+            // Decide on usable lines, not row count: service messages and captionless media are
+            // dropped later, so a "full" cache page can still be a short transcript.
+            List<String> fromCache = AiSummary.buildTranscript(cached, currentAccount, count);
+            if (fromCache.size() >= count) {
+                deliverAiSummary(loading, fromCache);
             } else {
-                AiSummary.fetchHistory(currentAccount, getDialogId(), count,
-                        fetched -> deliverAiSummary(loading, fetched.size() >= cached.size() ? fetched : cached, count));
+                AiSummary.fetchHistory(currentAccount, getDialogId(), count, fetched -> {
+                    List<String> fromServer = AiSummary.buildTranscript(fetched, currentAccount, count);
+                    deliverAiSummary(loading, fromServer.size() >= fromCache.size() ? fromServer : fromCache);
+                });
             }
         });
     }
 
-    private void deliverAiSummary(AlertDialog loading, java.util.ArrayList<TLRPC.Message> stored, int count) {
+    private void deliverAiSummary(AlertDialog loading, List<String> transcript) {
         loading.dismiss();
         if (getParentActivity() == null) {
             return;
         }
-        List<String> transcript = AiSummary.buildTranscript(stored, currentAccount, count);
         if (BuildVars.LOGS_ENABLED) {
-            FileLog.d("AiSummary: requested=" + count + " rows=" + stored.size() + " transcript=" + transcript.size());
+            FileLog.d("AiSummary: transcript=" + transcript.size());
         }
         if (transcript.isEmpty()) {
             BulletinFactory.of(this).createSimpleBulletin(R.raw.error, LocaleController.getString(R.string.AiSummaryEmpty)).show();

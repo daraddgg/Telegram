@@ -38,14 +38,12 @@ public class AiSummary {
     public static final String PREF_STREAMING = "ai_summary_streaming";
     public static final String PREF_SYSTEM_PROMPT = "ai_summary_system_prompt";
     public static final String PREF_HEADERS = "ai_summary_headers";
-    public static final String PREF_RANGE = "ai_summary_range";
 
     public static final String DEFAULT_BASE_URL = "https://api.openai.com/v1";
     public static final String DEFAULT_MODEL = "gpt-4o-mini";
     public static final float DEFAULT_TEMPERATURE = 0.2f;
     public static final int DEFAULT_MAX_TOKENS = 8192;
     public static final float DEFAULT_TOP_P = 1f;
-    public static final int DEFAULT_RANGE = 100;
     public static final int MIN_RANGE = 25;
 
     /** Messages per request before the transcript is split and merged. */
@@ -516,7 +514,10 @@ public class AiSummary {
                 if ("length".equals(choice.optString("finish_reason"))) {
                     throw new Exception("truncated: response hit max_tokens, raise it and retry");
                 }
-                content = choice.getJSONObject("message").getString("content");
+                // Reasoning models can return content:null with the text in their own key.
+                // optString keeps that out of getString's cryptic type error so requireJson
+                // below reports the real problem instead.
+                content = choice.getJSONObject("message").optString("content", "");
             }
             content = requireJson(content);
             if (content.isEmpty()) {
