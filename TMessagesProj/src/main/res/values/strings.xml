@@ -1409,6 +1409,8 @@
     <string name="AiSummaryCustomHeaders">Custom Headers (one Name: value per line)</string>
     <string name="AiSummaryStreaming">Streaming</string>
     <string name="AiSummaryStreamingTokens">Generating… %1$d tokens</string>
+    <string name="AiSummaryFetching">Fetching messages… %1$d/%2$d</string>
+    <string name="AiSummaryGenerating">Generating summary…</string>
     <string name="AiSummarySystemPrompt">System prompt</string>
     <string name="AiSummaryPromptDefault">Default</string>
     <string name="AiSummaryPromptCustom">Customized</string>

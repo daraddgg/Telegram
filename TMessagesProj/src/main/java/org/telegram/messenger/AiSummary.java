@@ -48,6 +48,12 @@ public class AiSummary {
 
     /** Messages per request before the transcript is split and merged. */
     private static final int CHUNK_MESSAGES = 250;
+    /**
+     * Characters per request. 250 messages can be 100k chars (~25k tokens), which overflows the
+     * context window of most free models — the message count alone was not a real limit.
+     * ponytail: chars/4 is the usual rough token ratio; Persian runs worse, hence the low budget.
+     */
+    private static final int CHUNK_CHARS = 24000;
     private static final int TIMEOUT_MS = 90000;
     private static final int MAX_TEXT_CHARS = 400;
     private static final Pattern REASONING_TAG =
@@ -275,12 +281,12 @@ public class AiSummary {
      * ponytail: sequential pages, one in flight at a time. 1000 messages is 10 round trips;
      * parallelise only if that ever feels slow.
      */
-    public static void fetchHistory(int currentAccount, long dialogId, int limit, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
-        fetchPage(currentAccount, dialogId, limit, 0, new ArrayList<>(), callback);
+    public static void fetchHistory(int currentAccount, long dialogId, int limit, Progress progress, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+        fetchPage(currentAccount, dialogId, limit, 0, new ArrayList<>(), progress, callback);
     }
 
     private static void fetchPage(int currentAccount, long dialogId, int limit, int offsetId,
-                                  ArrayList<TLRPC.Message> collected, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+                                  ArrayList<TLRPC.Message> collected, Progress progress, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
         TLRPC.TL_messages_getHistory req = new TLRPC.TL_messages_getHistory();
         req.peer = MessagesController.getInstance(currentAccount).getInputPeer(dialogId);
         req.offset_id = offsetId;
@@ -300,10 +306,13 @@ public class AiSummary {
             MessagesController.getInstance(currentAccount).putUsers(res.users, false);
             MessagesController.getInstance(currentAccount).putChats(res.chats, false);
             collected.addAll(res.messages);
+            if (progress != null) {
+                progress.onTokens(collected.size());
+            }
             if (res.messages.isEmpty() || collected.size() >= limit) {
                 callback.run(collected);
             } else {
-                fetchPage(currentAccount, dialogId, limit, res.messages.get(res.messages.size() - 1).id, collected, callback);
+                fetchPage(currentAccount, dialogId, limit, res.messages.get(res.messages.size() - 1).id, collected, progress, callback);
             }
         }));
     }
@@ -371,14 +380,34 @@ public class AiSummary {
         }
     }
 
-    private static String summarize(List<String> transcript, Progress progress) throws Exception {
-        if (transcript.size() <= CHUNK_MESSAGES) {
-            return complete(systemPrompt(), join(transcript, 0, transcript.size()), progress);
+    /**
+     * Splits at whichever limit hits first: message count or characters.
+     *
+     * Returns the exclusive end index of the chunk starting at {@code from}. Always advances by
+     * at least one line so a single over-long line can never loop forever.
+     */
+    static int chunkEnd(List<String> transcript, int from) {
+        int chars = 0;
+        int i = from;
+        while (i < transcript.size() && i - from < CHUNK_MESSAGES) {
+            chars += transcript.get(i).length() + 1;
+            i++;
+            if (chars >= CHUNK_CHARS) {
+                break;
+            }
         }
+        return Math.max(i, from + 1);
+    }
+
+    private static String summarize(List<String> transcript, Progress progress) throws Exception {
         List<String> partials = new ArrayList<>();
-        for (int start = 0; start < transcript.size(); start += CHUNK_MESSAGES) {
-            int end = Math.min(start + CHUNK_MESSAGES, transcript.size());
+        for (int start = 0; start < transcript.size(); ) {
+            int end = chunkEnd(transcript, start);
             partials.add(complete(systemPrompt(), join(transcript, start, end), progress));
+            start = end;
+        }
+        if (partials.size() == 1) {
+            return partials.get(0);
         }
         return complete(systemPrompt() + "\n\n" + MERGE_INSTRUCTION, join(partials, 0, partials.size()), progress);
     }
@@ -472,6 +501,7 @@ public class AiSummary {
                     + " user_chars=" + userContent.length()
                     + " user_non_ascii=" + countNonAscii(userContent)
                     + " payload_bytes=" + payload.length
+                    + " est_input_tokens=" + (systemPrompt.length() + userContent.length()) / 4
                     + " stream=" + stream
                     + " model=" + model);
         }
@@ -498,7 +528,11 @@ public class AiSummary {
             }
             int code = connection.getResponseCode();
             if (code >= 400) {
-                throw new Exception("HTTP " + code + ": " + trimForError(readAll(connection.getErrorStream())));
+                String body = trimForError(readAll(connection.getErrorStream()));
+                if (BuildVars.LOGS_ENABLED) {
+                    FileLog.d("AiSummary: HTTP " + code + " body=" + body);
+                }
+                throw new Exception("HTTP " + code + ": " + body);
             }
             String content;
             if (stream) {
@@ -627,7 +661,9 @@ public class AiSummary {
 
     private static String trimForError(String body) {
         String trimmed = body.trim();
-        return trimmed.length() > 300 ? trimmed.substring(0, 300) : trimmed;
+        // The provider's own words are the whole diagnostic value: context-window overflow,
+        // rate limit and quota errors all look identical once truncated to a generic message.
+        return trimmed.length() > 1500 ? trimmed.substring(0, 1500) + "…" : trimmed;
     }
 
     /** Non-ASCII count: a Persian transcript that arrives here as 0 has been mangled upstream. */

@@ -11246,7 +11246,11 @@ public class ChatActivity extends BaseFragment implements
     }
 
     private void runAiSummary(int count) {
-        AlertDialog loading = new AlertDialog(getParentActivity(), AlertDialog.ALERT_TYPE_SPINNER, themeDelegate);
+        // Fetch is its own visible phase: a stalled percentage is the symptom that used to be
+        // invisible when everything hid behind one spinner.
+        AlertDialog loading = new AlertDialog(getParentActivity(), AlertDialog.ALERT_TYPE_LOADING, themeDelegate);
+        loading.setTitle(LocaleController.getString(R.string.AiSummary));
+        loading.setMessage(LocaleController.formatString(R.string.AiSummaryFetching, 0, count));
         loading.show();
         getMessagesStorage().getLastMessagesForSummary(getDialogId(), count, cached -> {
             if (getParentActivity() == null) {
@@ -11257,9 +11261,14 @@ public class ChatActivity extends BaseFragment implements
             // dropped later, so a "full" cache page can still be a short transcript.
             List<String> fromCache = AiSummary.buildTranscript(cached, currentAccount, count);
             if (fromCache.size() >= count) {
+                loading.setProgress(100);
+                loading.setMessage(LocaleController.formatString(R.string.AiSummaryFetching, fromCache.size(), count));
                 deliverAiSummary(loading, fromCache);
             } else {
                 AiSummary.fetchHistory(currentAccount, getDialogId(), count, fetched -> {
+                    loading.setMessage(LocaleController.formatString(R.string.AiSummaryFetching, fetched, count));
+                    loading.setProgress(Math.min(100, fetched * 100 / Math.max(1, count)));
+                }, fetched -> {
                     List<String> fromServer = AiSummary.buildTranscript(fetched, currentAccount, count);
                     deliverAiSummary(loading, fromServer.size() >= fromCache.size() ? fromServer : fromCache);
                 });
@@ -11284,17 +11293,16 @@ public class ChatActivity extends BaseFragment implements
 
     private void sendAiSummary(List<String> transcript) {
         final boolean streaming = AiSummary.isStreaming();
-        AlertDialog progress = new AlertDialog(getParentActivity(),
-                streaming ? AlertDialog.ALERT_TYPE_LOADING : AlertDialog.ALERT_TYPE_SPINNER, themeDelegate);
-        if (streaming) {
-            // Title and message must exist before show(): the dialog builds its views once.
-            progress.setTitle(LocaleController.getString(R.string.AiSummary));
-            progress.setMessage(LocaleController.formatString(R.string.AiSummaryStreamingTokens, 0));
-        }
+        // Second phase, visibly distinct from fetching: same progress dialog, its own wording.
+        AlertDialog progress = new AlertDialog(getParentActivity(), AlertDialog.ALERT_TYPE_LOADING, themeDelegate);
+        progress.setTitle(LocaleController.getString(R.string.AiSummary));
+        progress.setMessage(LocaleController.getString(R.string.AiSummaryGenerating));
         progress.show();
         AiSummary.request(transcript, tokens -> {
-            progress.setMessage(LocaleController.formatString(R.string.AiSummaryStreamingTokens, tokens));
-            progress.setProgress(AiSummary.streamPercent(tokens));
+            if (streaming) {
+                progress.setMessage(LocaleController.formatString(R.string.AiSummaryStreamingTokens, tokens));
+                progress.setProgress(AiSummary.streamPercent(tokens));
+            }
         }, (summary, error) -> {
             progress.dismiss();
             if (getParentActivity() == null) {
