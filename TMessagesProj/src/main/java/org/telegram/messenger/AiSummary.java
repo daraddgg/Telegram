@@ -54,6 +54,12 @@ public class AiSummary {
      * ponytail: chars/4 is the usual rough token ratio; Persian runs worse, hence the low budget.
      */
     private static final int CHUNK_CHARS = 24000;
+    /**
+     * Messages per history page. Below the TL cap of 100 on purpose: the progress bar can only
+     * move once per page, so a smaller page is what makes 50 look gradual instead of one jump.
+     * ponytail: 10 pages for 500 messages instead of 5 — more round trips, smoother bar.
+     */
+    private static final int PAGE_MESSAGES = 10;
     private static final int TIMEOUT_MS = 90000;
     private static final int MAX_TEXT_CHARS = 400;
     private static final Pattern REASONING_TAG =
@@ -158,6 +164,61 @@ public class AiSummary {
         void onTokens(int tokens);
     }
 
+    /**
+     * One handle that aborts everything a single summary run owns: the in-flight TL history
+     * request and the HTTP connection to the model.
+     *
+     * Closing the dialog used to hide the UI and leave both running, so a cancelled summary kept
+     * burning network and quota, and a second tap raced with the first run's callbacks.
+     */
+    public static class Cancellation {
+
+        private volatile boolean cancelled;
+        private volatile HttpURLConnection connection;
+        private volatile int tlToken;
+        private volatile int tlAccount = -1;
+
+        public void cancel() {
+            cancelled = true;
+            HttpURLConnection open = connection;
+            connection = null;
+            if (open != null) {
+                // disconnect() unblocks a thread parked in read(): the only way to stop an
+                // HttpURLConnection mid-response.
+                open.disconnect();
+            }
+            int token = tlToken;
+            int account = tlAccount;
+            tlToken = 0;
+            if (token != 0 && account >= 0) {
+                ConnectionsManager.getInstance(account).cancelRequest(token, false);
+            }
+        }
+
+        public boolean isCancelled() {
+            return cancelled;
+        }
+
+        void attach(HttpURLConnection open) {
+            connection = open;
+            if (cancelled) {
+                open.disconnect();
+            }
+        }
+
+        void detach() {
+            connection = null;
+        }
+
+        void attachTl(int account, int token) {
+            tlAccount = account;
+            tlToken = token;
+            if (cancelled) {
+                ConnectionsManager.getInstance(account).cancelRequest(token, false);
+            }
+        }
+    }
+
     private AiSummary() {
     }
 
@@ -255,15 +316,19 @@ public class AiSummary {
      * Runs the request off the main thread and delivers the result on the main thread.
      * Transcripts longer than one request are summarized in chunks and merged, never truncated.
      */
-    public static void request(List<String> transcript, Progress progress, Callback callback) {
+    public static void request(List<String> transcript, Progress progress, Cancellation cancellation, Callback callback) {
         Utilities.globalQueue.postRunnable(() -> {
             String summary = null;
             String error = null;
             try {
-                summary = summarize(transcript, progress);
+                summary = summarize(transcript, progress, cancellation);
             } catch (Exception e) {
                 FileLog.e(e);
                 error = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            }
+            // A cancelled run must not deliver anything: no summary, no error dialog.
+            if (cancellation != null && cancellation.isCancelled()) {
+                return;
             }
             final String resultSummary = summary == null ? null : applyStatistics(summary, transcript);
             final String resultError = error;
@@ -281,21 +346,30 @@ public class AiSummary {
      * ponytail: sequential pages, one in flight at a time. 1000 messages is 10 round trips;
      * parallelise only if that ever feels slow.
      */
-    public static void fetchHistory(int currentAccount, long dialogId, int limit, Progress progress, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
-        fetchPage(currentAccount, dialogId, limit, 0, new ArrayList<>(), progress, callback);
+    public static void fetchHistory(int currentAccount, long dialogId, int limit, Progress progress,
+                                    Cancellation cancellation, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+        fetchPage(currentAccount, dialogId, limit, 0, new ArrayList<>(), progress, cancellation, callback);
     }
 
     private static void fetchPage(int currentAccount, long dialogId, int limit, int offsetId,
-                                  ArrayList<TLRPC.Message> collected, Progress progress, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+                                  ArrayList<TLRPC.Message> collected, Progress progress,
+                                  Cancellation cancellation, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+        if (cancellation != null && cancellation.isCancelled()) {
+            return;
+        }
         TLRPC.TL_messages_getHistory req = new TLRPC.TL_messages_getHistory();
         req.peer = MessagesController.getInstance(currentAccount).getInputPeer(dialogId);
         req.offset_id = offsetId;
-        req.limit = Math.min(100, limit - collected.size());
+        req.limit = Math.min(PAGE_MESSAGES, limit - collected.size());
         if (req.peer == null || req.limit <= 0) {
             AndroidUtilities.runOnUIThread(() -> callback.run(collected));
             return;
         }
-        ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
+        final int before = collected.size();
+        int token = ConnectionsManager.getInstance(currentAccount).sendRequest(req, (response, error) -> AndroidUtilities.runOnUIThread(() -> {
+            if (cancellation != null && cancellation.isCancelled()) {
+                return;
+            }
             if (!(response instanceof TLRPC.messages_Messages)) {
                 callback.run(collected);
                 return;
@@ -309,12 +383,16 @@ public class AiSummary {
             if (progress != null) {
                 progress.onTokens(collected.size());
             }
-            if (res.messages.isEmpty() || collected.size() >= limit) {
+            if (res.messages.isEmpty() || collected.size() >= limit || collected.size() == before) {
                 callback.run(collected);
             } else {
-                fetchPage(currentAccount, dialogId, limit, res.messages.get(res.messages.size() - 1).id, collected, progress, callback);
+                fetchPage(currentAccount, dialogId, limit, res.messages.get(res.messages.size() - 1).id,
+                        collected, progress, cancellation, callback);
             }
         }));
+        if (cancellation != null) {
+            cancellation.attachTl(currentAccount, token);
+        }
     }
 
     /**
@@ -399,17 +477,37 @@ public class AiSummary {
         return Math.max(i, from + 1);
     }
 
-    private static String summarize(List<String> transcript, Progress progress) throws Exception {
+    private static String summarize(List<String> transcript, Progress progress, Cancellation cancellation) throws Exception {
         List<String> partials = new ArrayList<>();
         for (int start = 0; start < transcript.size(); ) {
             int end = chunkEnd(transcript, start);
-            partials.add(complete(systemPrompt(), join(transcript, start, end), progress));
+            partials.add(complete(systemPrompt(), join(transcript, start, end), progress, cancellation));
             start = end;
         }
-        if (partials.size() == 1) {
-            return partials.get(0);
+        // Incremental fold: the merge step is itself a request with the same context limit, so
+        // merging 10 partials in one call would overflow exactly like the un-chunked transcript did.
+        // Each round merges only as many partials as fit the budget, until one is left.
+        while (partials.size() > 1) {
+            List<String> merged = new ArrayList<>();
+            for (int start = 0; start < partials.size(); ) {
+                int end = chunkEnd(partials, start);
+                if (end - start == 1 && partials.size() > 1) {
+                    // A partial too large to pair with anything passes through untouched rather
+                    // than being re-summarized alone, which would only lose detail.
+                    merged.add(partials.get(start));
+                } else {
+                    merged.add(complete(systemPrompt() + "\n\n" + MERGE_INSTRUCTION,
+                            join(partials, start, end), progress, cancellation));
+                }
+                start = end;
+            }
+            if (merged.size() == partials.size()) {
+                // No round made progress: merging further cannot terminate, so keep the first.
+                return merged.get(0);
+            }
+            partials = merged;
         }
-        return complete(systemPrompt() + "\n\n" + MERGE_INSTRUCTION, join(partials, 0, partials.size()), progress);
+        return partials.isEmpty() ? "" : partials.get(0);
     }
 
     /**
@@ -454,7 +552,10 @@ public class AiSummary {
         return body.length() > 2000 ? body.substring(0, 2000) + "…" : body;
     }
 
-    private static String complete(String systemPrompt, String userContent, Progress progress) throws Exception {
+    private static String complete(String systemPrompt, String userContent, Progress progress, Cancellation cancellation) throws Exception {
+        if (cancellation != null && cancellation.isCancelled()) {
+            throw new Exception("cancelled");
+        }
         SharedPreferences prefs = prefs();
         String baseUrl = prefs.getString(PREF_BASE_URL, DEFAULT_BASE_URL);
         String model = prefs.getString(PREF_MODEL, DEFAULT_MODEL);
@@ -507,6 +608,9 @@ public class AiSummary {
         }
 
         HttpURLConnection connection = (HttpURLConnection) new URL(baseUrl + "/chat/completions").openConnection();
+        if (cancellation != null) {
+            cancellation.attach(connection);
+        }
         try {
             connection.setRequestMethod("POST");
             connection.setConnectTimeout(TIMEOUT_MS);
@@ -536,7 +640,7 @@ public class AiSummary {
             }
             String content;
             if (stream) {
-                content = readStream(connection.getInputStream(), progress);
+                content = readStream(connection.getInputStream(), progress, cancellation);
             } else {
                 String body = readAll(connection.getInputStream());
                 if (BuildVars.LOGS_ENABLED) {
@@ -559,6 +663,9 @@ public class AiSummary {
             }
             return content;
         } finally {
+            if (cancellation != null) {
+                cancellation.detach();
+            }
             connection.disconnect();
         }
     }
@@ -595,13 +702,16 @@ public class AiSummary {
      * The schema output is one JSON object, so showing partial text would put `{"executive_su` on
      * screen. Only the count is surfaced; the parsed object is still rendered once complete.
      */
-    private static String readStream(InputStream stream, Progress progress) throws Exception {
+    private static String readStream(InputStream stream, Progress progress, Cancellation cancellation) throws Exception {
         StringBuilder content = new StringBuilder();
         int tokens = 0;
         boolean truncated = false;
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
+                if (cancellation != null && cancellation.isCancelled()) {
+                    throw new Exception("cancelled");
+                }
                 truncated |= line.contains("\"finish_reason\":\"length\"") || line.contains("\"finish_reason\": \"length\"");
                 String delta = streamDelta(line);
                 if (delta == null) {
