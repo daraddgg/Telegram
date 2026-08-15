@@ -11338,10 +11338,22 @@ public class ChatActivity extends BaseFragment implements
             d.dismiss();
         });
         progress.show();
+        // Both callbacks write the same line, so the part label lives here and the streaming
+        // counter appends to it — otherwise per-token updates would erase "part 2 of 4".
+        final String[] part = { "" };
         AiSummary.request(transcript, tokens -> {
             if (streaming) {
-                progress.setMessage(LocaleController.formatString(R.string.AiSummaryStreamingTokens, tokens));
-                progress.setProgress(AiSummary.streamPercent(tokens));
+                progress.setMessage(part[0] + LocaleController.formatString(R.string.AiSummaryStreamingTokens, tokens));
+                if (part[0].isEmpty()) {
+                    progress.setProgress(AiSummary.streamPercent(tokens));
+                }
+            }
+        }, (done, total) -> {
+            // Multi-chunk runs would otherwise sit on one message for minutes with no sign of life.
+            if (total > 1) {
+                part[0] = LocaleController.formatString(R.string.AiSummaryGeneratingPart, done + 1, total) + " · ";
+                progress.setMessage(part[0]);
+                progress.setProgress(done * 100 / total);
             }
         }, cancellation, (summary, error) -> {
             progress.dismiss();

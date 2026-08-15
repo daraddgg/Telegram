@@ -55,11 +55,14 @@ public class AiSummary {
      */
     private static final int CHUNK_CHARS = 24000;
     /**
-     * Messages per history page. Below the TL cap of 100 on purpose: the progress bar can only
-     * move once per page, so a smaller page is what makes 50 look gradual instead of one jump.
-     * ponytail: 10 pages for 500 messages instead of 5 — more round trips, smoother bar.
+     * Messages per history page, derived from the range so the bar always moves in ~10 steps.
+     *
+     * A fixed small page looks smooth for 50 but turns 1000 into 100 round trips, which is how a
+     * client earns a flood wait. Clamped to the TL cap of 100.
      */
-    private static final int PAGE_MESSAGES = 10;
+    static int pageSize(int limit) {
+        return Math.max(10, Math.min(100, limit / 10));
+    }
     private static final int TIMEOUT_MS = 90000;
     private static final int MAX_TEXT_CHARS = 400;
     private static final Pattern REASONING_TAG =
@@ -162,6 +165,11 @@ public class AiSummary {
     /** Token counter for the streaming path; each SSE delta event is one token. */
     public interface Progress {
         void onTokens(int tokens);
+    }
+
+    /** Request-level progress: which chunk of how many is being summarized. */
+    public interface Stage {
+        void onStep(int done, int total);
     }
 
     /**
@@ -316,12 +324,12 @@ public class AiSummary {
      * Runs the request off the main thread and delivers the result on the main thread.
      * Transcripts longer than one request are summarized in chunks and merged, never truncated.
      */
-    public static void request(List<String> transcript, Progress progress, Cancellation cancellation, Callback callback) {
+    public static void request(List<String> transcript, Progress progress, Stage stage, Cancellation cancellation, Callback callback) {
         Utilities.globalQueue.postRunnable(() -> {
             String summary = null;
             String error = null;
             try {
-                summary = summarize(transcript, progress, cancellation);
+                summary = summarize(transcript, progress, stage, cancellation);
             } catch (Exception e) {
                 FileLog.e(e);
                 error = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
@@ -360,7 +368,7 @@ public class AiSummary {
         TLRPC.TL_messages_getHistory req = new TLRPC.TL_messages_getHistory();
         req.peer = MessagesController.getInstance(currentAccount).getInputPeer(dialogId);
         req.offset_id = offsetId;
-        req.limit = Math.min(PAGE_MESSAGES, limit - collected.size());
+        req.limit = Math.min(pageSize(limit), limit - collected.size());
         if (req.peer == null || req.limit <= 0) {
             AndroidUtilities.runOnUIThread(() -> callback.run(collected));
             return;
@@ -461,28 +469,44 @@ public class AiSummary {
     /**
      * Splits at whichever limit hits first: message count or characters.
      *
-     * Returns the exclusive end index of the chunk starting at {@code from}. Always advances by
-     * at least one line so a single over-long line can never loop forever.
+     * Returns the exclusive end index of the chunk starting at {@code from}. A line is only taken
+     * when it still fits, so a chunk never exceeds the budget — the earlier add-then-check version
+     * overshot by a whole line, which was invisible for 200-char transcript lines but doubled the
+     * payload when the lines being chunked were 20k-char partial summaries. Always advances by at
+     * least one line so a single over-long line can never loop forever.
      */
     static int chunkEnd(List<String> transcript, int from) {
         int chars = 0;
         int i = from;
         while (i < transcript.size() && i - from < CHUNK_MESSAGES) {
-            chars += transcript.get(i).length() + 1;
-            i++;
-            if (chars >= CHUNK_CHARS) {
+            int next = chars + transcript.get(i).length() + 1;
+            if (next > CHUNK_CHARS && i > from) {
                 break;
             }
+            chars = next;
+            i++;
         }
         return Math.max(i, from + 1);
     }
 
-    private static String summarize(List<String> transcript, Progress progress, Cancellation cancellation) throws Exception {
-        List<String> partials = new ArrayList<>();
+    private static String summarize(List<String> transcript, Progress progress, Stage stage, Cancellation cancellation) throws Exception {
+        // Chunk boundaries are known before any request, so the user can be told "1 of 4" instead
+        // of watching a still bar through four sequential calls.
+        List<int[]> bounds = new ArrayList<>();
         for (int start = 0; start < transcript.size(); ) {
             int end = chunkEnd(transcript, start);
-            partials.add(complete(systemPrompt(), join(transcript, start, end), progress, cancellation));
+            bounds.add(new int[]{start, end});
             start = end;
+        }
+        List<String> partials = new ArrayList<>();
+        for (int i = 0; i < bounds.size(); i++) {
+            if (stage != null) {
+                final int done = i;
+                final int total = bounds.size();
+                AndroidUtilities.runOnUIThread(() -> stage.onStep(done, total));
+            }
+            int[] b = bounds.get(i);
+            partials.add(complete(systemPrompt(), join(transcript, b[0], b[1]), progress, cancellation));
         }
         // Incremental fold: the merge step is itself a request with the same context limit, so
         // merging 10 partials in one call would overflow exactly like the un-chunked transcript did.
@@ -491,7 +515,7 @@ public class AiSummary {
             List<String> merged = new ArrayList<>();
             for (int start = 0; start < partials.size(); ) {
                 int end = chunkEnd(partials, start);
-                if (end - start == 1 && partials.size() > 1) {
+                if (end - start == 1) {
                     // A partial too large to pair with anything passes through untouched rather
                     // than being re-summarized alone, which would only lose detail.
                     merged.add(partials.get(start));
@@ -501,8 +525,9 @@ public class AiSummary {
                 }
                 start = end;
             }
-            if (merged.size() == partials.size()) {
-                // No round made progress: merging further cannot terminate, so keep the first.
+            if (merged.size() >= partials.size()) {
+                // No round made progress: every partial is too large to pair, so merging further
+                // cannot terminate. The first chunk is the oldest span, which is the safest keep.
                 return merged.get(0);
             }
             partials = merged;
