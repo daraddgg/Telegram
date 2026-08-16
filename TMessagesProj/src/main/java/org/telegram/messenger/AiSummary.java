@@ -351,17 +351,21 @@ public class AiSummary {
      * messages — so reading it made every range return the same rows and the same
      * duration_minutes. messages.getHistory caps a page at 100, hence the paging loop.
      *
+     * The callback's error string is null unless the fetch stopped early (flood wait, unknown
+     * peer); the messages collected before the failure are still delivered so a partial range is
+     * summarized rather than dropped.
+     *
      * ponytail: sequential pages, one in flight at a time. 1000 messages is 10 round trips;
      * parallelise only if that ever feels slow.
      */
     public static void fetchHistory(int currentAccount, long dialogId, int limit, Progress progress,
-                                    Cancellation cancellation, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+                                    Cancellation cancellation, Utilities.Callback2<ArrayList<TLRPC.Message>, String> callback) {
         fetchPage(currentAccount, dialogId, limit, 0, new ArrayList<>(), progress, cancellation, callback);
     }
 
     private static void fetchPage(int currentAccount, long dialogId, int limit, int offsetId,
                                   ArrayList<TLRPC.Message> collected, Progress progress,
-                                  Cancellation cancellation, Utilities.Callback<ArrayList<TLRPC.Message>> callback) {
+                                  Cancellation cancellation, Utilities.Callback2<ArrayList<TLRPC.Message>, String> callback) {
         if (cancellation != null && cancellation.isCancelled()) {
             return;
         }
@@ -370,7 +374,8 @@ public class AiSummary {
         req.offset_id = offsetId;
         req.limit = Math.min(pageSize(limit), limit - collected.size());
         if (req.peer == null || req.limit <= 0) {
-            AndroidUtilities.runOnUIThread(() -> callback.run(collected));
+            String reason = req.peer == null && collected.isEmpty() ? "chat peer not found" : null;
+            AndroidUtilities.runOnUIThread(() -> callback.run(collected, reason));
             return;
         }
         final int before = collected.size();
@@ -378,8 +383,16 @@ public class AiSummary {
             if (cancellation != null && cancellation.isCancelled()) {
                 return;
             }
-            if (!(response instanceof TLRPC.messages_Messages)) {
-                callback.run(collected);
+            if (error != null || !(response instanceof TLRPC.messages_Messages)) {
+                String reason = error != null
+                        ? "Telegram error " + error.code + ": " + error.text
+                        : "unexpected empty response";
+                // The fetch phase used to swallow MTProto errors whole, so a flood wait during a
+                // 1000-message range surfaced as "no messages to summarize" with no log line.
+                if (BuildVars.LOGS_ENABLED) {
+                    FileLog.e("AiSummary: fetch stopped after " + collected.size() + " of " + limit + " messages: " + reason);
+                }
+                callback.run(collected, reason);
                 return;
             }
             TLRPC.messages_Messages res = (TLRPC.messages_Messages) response;
@@ -392,7 +405,7 @@ public class AiSummary {
                 progress.onTokens(collected.size());
             }
             if (res.messages.isEmpty() || collected.size() >= limit || collected.size() == before) {
-                callback.run(collected);
+                callback.run(collected, null);
             } else {
                 fetchPage(currentAccount, dialogId, limit, res.messages.get(res.messages.size() - 1).id,
                         collected, progress, cancellation, callback);
@@ -526,13 +539,92 @@ public class AiSummary {
                 start = end;
             }
             if (merged.size() >= partials.size()) {
-                // No round made progress: every partial is too large to pair, so merging further
-                // cannot terminate. The first chunk is the oldest span, which is the safest keep.
-                return merged.get(0);
+                // No round made progress: every partial alone exceeds half the char budget, so no
+                // two can share a merge call. Returning only the first chunk silently dropped the
+                // newer spans while applyStatistics still reported the full range; merge locally
+                // instead — offline, deterministic, and lossless.
+                return mergeObjects(merged);
             }
             partials = merged;
         }
         return partials.isEmpty() ? "" : partials.get(0);
+    }
+
+    /**
+     * Deterministic local merge for the fold's stall case: no model call, nothing dropped.
+     *
+     * Arrays append in chunk order with exact-duplicate elements removed, nested objects merge
+     * key by key, strings join with a newline. Numbers and type mismatches keep the earlier
+     * span's value — they are model estimates anyway, and statistics is overwritten in-app later.
+     */
+    static String mergeObjects(List<String> partials) {
+        JSONObject merged = null;
+        for (String partial : partials) {
+            try {
+                String body = partial.trim();
+                int start = body.indexOf('{');
+                int end = body.lastIndexOf('}');
+                JSONObject object = new JSONObject(body.substring(start, end + 1));
+                if (merged == null) {
+                    merged = object;
+                } else {
+                    mergeInto(merged, object);
+                }
+            } catch (Exception e) {
+                // One malformed partial must not discard the others' content.
+                FileLog.e(e);
+            }
+        }
+        return merged == null ? (partials.isEmpty() ? "" : partials.get(0)) : merged.toString();
+    }
+
+    private static void mergeInto(JSONObject merged, JSONObject object) {
+        for (java.util.Iterator<String> it = object.keys(); it.hasNext(); ) {
+            String key = it.next();
+            try {
+                merged.put(key, mergeValues(merged.opt(key), object.opt(key)));
+            } catch (Exception e) {
+                FileLog.e(e);
+            }
+        }
+    }
+
+    private static Object mergeValues(Object base, Object add) {
+        if (base == null || JSONObject.NULL.equals(base)) {
+            return add;
+        }
+        if (add == null || JSONObject.NULL.equals(add)) {
+            return base;
+        }
+        if (base instanceof JSONArray && add instanceof JSONArray) {
+            JSONArray array = new JSONArray();
+            java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+            appendUnique(array, seen, (JSONArray) base);
+            appendUnique(array, seen, (JSONArray) add);
+            return array;
+        }
+        if (base instanceof JSONObject && add instanceof JSONObject) {
+            mergeInto((JSONObject) base, (JSONObject) add);
+            return base;
+        }
+        if (base instanceof String && add instanceof String) {
+            String first = ((String) base).trim();
+            String second = ((String) add).trim();
+            return first.isEmpty() ? second : second.isEmpty() ? first : first + "\n" + second;
+        }
+        return base;
+    }
+
+    private static void appendUnique(JSONArray out, java.util.Set<String> seen, JSONArray source) {
+        for (int i = 0; i < source.length(); i++) {
+            Object item = source.opt(i);
+            if (item == null || JSONObject.NULL.equals(item)) {
+                continue;
+            }
+            if (seen.add(item.toString())) {
+                out.put(item);
+            }
+        }
     }
 
     /**

@@ -3337,6 +3337,10 @@ public class ChatActivity extends BaseFragment implements
             aiSummaryCancellation.cancel();
             aiSummaryCancellation = null;
         }
+        if (aiSummaryDialog != null) {
+            aiSummaryDialog.dismiss();
+            aiSummaryDialog = null;
+        }
         if (messageMetricsView != null) {
             messageMetricsView.finish();
         }
@@ -11251,11 +11255,19 @@ public class ChatActivity extends BaseFragment implements
     }
 
     private AiSummary.Cancellation aiSummaryCancellation;
+    private AlertDialog aiSummaryDialog;
 
     /** Cancels whatever a previous AI Summary run left in flight and hands back a fresh handle. */
     private AiSummary.Cancellation restartAiSummary() {
         if (aiSummaryCancellation != null) {
             aiSummaryCancellation.cancel();
+        }
+        // A run cancelled by leaving the chat never reaches its own dismissal, and these dialogs
+        // are not tracked by BaseFragment.visibleDialog, so tear the dialog down here and in
+        // onFragmentDestroy — otherwise it outlives the fragment on the activity's window.
+        if (aiSummaryDialog != null) {
+            aiSummaryDialog.dismiss();
+            aiSummaryDialog = null;
         }
         return aiSummaryCancellation = new AiSummary.Cancellation();
     }
@@ -11278,6 +11290,7 @@ public class ChatActivity extends BaseFragment implements
             cancellation.cancel();
             d.dismiss();
         });
+        aiSummaryDialog = loading;
         loading.show();
         getMessagesStorage().getLastMessagesForSummary(getDialogId(), count, cached -> {
             if (getParentActivity() == null || cancellation.isCancelled()) {
@@ -11292,18 +11305,30 @@ public class ChatActivity extends BaseFragment implements
                 loading.setMessage(LocaleController.formatString(R.string.AiSummaryFetching, fromCache.size(), count));
                 deliverAiSummary(loading, fromCache, cancellation);
             } else {
-                AiSummary.fetchHistory(currentAccount, getDialogId(), count, fetched -> {
-                    int shown = Math.min(fetched, count);
+                AiSummary.fetchHistory(currentAccount, getDialogId(), count, fetchedCount -> {
+                    int shown = Math.min(fetchedCount, count);
                     loading.setMessage(LocaleController.formatString(R.string.AiSummaryFetching, shown, count));
                     // Clamped both ways: a page can overshoot the target, and count is never 0.
                     loading.setProgress(Math.max(0, Math.min(100, shown * 100 / Math.max(1, count))));
-                }, cancellation, fetched -> {
-                    if (cancellation.isCancelled()) {
+                }, cancellation, (fetched, fetchError) -> {
+                    if (cancellation.isCancelled() || getParentActivity() == null) {
                         loading.dismiss();
                         return;
                     }
                     List<String> fromServer = AiSummary.buildTranscript(fetched, currentAccount, count);
-                    deliverAiSummary(loading, fromServer.size() >= fromCache.size() ? fromServer : fromCache, cancellation);
+                    List<String> best = fromServer.size() >= fromCache.size() ? fromServer : fromCache;
+                    if (best.isEmpty() && fetchError != null) {
+                        // Both sources empty with a known cause: the "nothing to summarize"
+                        // bulletin used to hide flood waits and other fetch failures entirely.
+                        loading.dismiss();
+                        new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                                .setTitle(LocaleController.getString(R.string.AiSummary))
+                                .setMessage(LocaleController.formatString(R.string.AiSummaryFetchError, fetchError))
+                                .setPositiveButton(LocaleController.getString(R.string.OK), null)
+                                .show();
+                        return;
+                    }
+                    deliverAiSummary(loading, best, cancellation);
                 });
             }
         });
@@ -11337,6 +11362,7 @@ public class ChatActivity extends BaseFragment implements
             cancellation.cancel();
             d.dismiss();
         });
+        aiSummaryDialog = progress;
         progress.show();
         // Both callbacks write the same line, so the part label lives here and the streaming
         // counter appends to it — otherwise per-token updates would erase "part 2 of 4".
