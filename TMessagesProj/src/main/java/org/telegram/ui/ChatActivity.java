@@ -11349,9 +11349,54 @@ public class ChatActivity extends BaseFragment implements
         sendAiSummary(transcript, cancellation);
     }
 
+    /**
+     * Indeterminate "waiting for the model" dialog: a spinner plus a line of text and Cancel.
+     *
+     * ALERT_TYPE_SPINNER draws no message at all, and ALERT_TYPE_LOADING can only draw a
+     * percentage — neither is honest while the provider has sent nothing, so the spinner is built
+     * as a custom view instead.
+     */
+    private AlertDialog createAiSummaryConnectingDialog(AiSummary.Cancellation cancellation, TextView[] labelOut) {
+        LinearLayout row = new LinearLayout(getParentActivity());
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(24), dp(8), dp(24), dp(8));
+
+        RadialProgressView spinner = new RadialProgressView(getParentActivity(), themeDelegate);
+        spinner.setSize(dp(24));
+        spinner.setStrokeWidth(2.5f);
+        spinner.setProgressColor(getThemedColor(Theme.key_dialogLineProgress));
+        row.addView(spinner, LayoutHelper.createLinear(32, 32, Gravity.CENTER_VERTICAL, 0, 0, 12, 0));
+
+        TextView label = new TextView(getParentActivity());
+        label.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
+        label.setTextColor(getThemedColor(Theme.key_dialogTextBlack));
+        label.setText(LocaleController.getString(R.string.AiSummaryConnecting));
+        row.addView(label, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT, Gravity.CENTER_VERTICAL));
+        labelOut[0] = label;
+
+        return new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                .setTitle(LocaleController.getString(R.string.AiSummary))
+                .setView(row)
+                .setOnCancelListener(d -> cancellation.cancel())
+                .setNegativeButton(LocaleController.getString(R.string.Cancel), (d, w) -> {
+                    cancellation.cancel();
+                    d.dismiss();
+                })
+                .create();
+    }
+
     private void sendAiSummary(List<String> transcript, AiSummary.Cancellation cancellation) {
         final boolean streaming = AiSummary.isStreaming();
-        // Second phase, visibly distinct from fetching: same progress dialog, its own wording.
+        // Two visually different waits, because they fail differently: a queued free-tier model
+        // produces nothing for minutes, and a percentage frozen at 0 reads as a crash. So waiting
+        // for the first token gets an indeterminate spinner, and only a request that has actually
+        // started answering gets the percentage bar.
+        final TextView[] connectingLabel = new TextView[1];
+        AlertDialog connecting = createAiSummaryConnectingDialog(cancellation, connectingLabel);
+        connecting.setCanceledOnTouchOutside(true);
+        connecting.setCancelable(true);
+
         AlertDialog progress = new AlertDialog(getParentActivity(), AlertDialog.ALERT_TYPE_LOADING, themeDelegate);
         progress.setTitle(LocaleController.getString(R.string.AiSummary));
         progress.setMessage(LocaleController.getString(R.string.AiSummaryGenerating));
@@ -11362,13 +11407,21 @@ public class ChatActivity extends BaseFragment implements
             cancellation.cancel();
             d.dismiss();
         });
-        aiSummaryDialog = progress;
-        progress.show();
+
+        aiSummaryDialog = connecting;
+        connecting.show();
         // Both callbacks write the same line, so the part label lives here and the streaming
         // counter appends to it — otherwise per-token updates would erase "part 2 of 4".
         final String[] part = { "" };
+        final int[] partIndex = { 0, 0 };
+        final boolean[] receiving = { false };
+        final Runnable dismissBoth = () -> {
+            connecting.dismiss();
+            progress.dismiss();
+            aiSummaryDialog = null;
+        };
         AiSummary.request(transcript, tokens -> {
-            if (streaming) {
+            if (streaming && receiving[0]) {
                 progress.setMessage(part[0] + LocaleController.formatString(R.string.AiSummaryStreamingTokens, tokens));
                 if (part[0].isEmpty()) {
                     progress.setProgress(AiSummary.streamPercent(tokens));
@@ -11376,23 +11429,52 @@ public class ChatActivity extends BaseFragment implements
             }
         }, (done, total) -> {
             // Multi-chunk runs would otherwise sit on one message for minutes with no sign of life.
+            partIndex[0] = done + 1;
+            partIndex[1] = total;
             if (total > 1) {
                 part[0] = LocaleController.formatString(R.string.AiSummaryGeneratingPart, done + 1, total) + " · ";
                 progress.setMessage(part[0]);
                 progress.setProgress(done * 100 / total);
+                if (connectingLabel[0] != null) {
+                    connectingLabel[0].setText(LocaleController.formatString(R.string.AiSummaryConnectingPart, done + 1, total));
+                }
+            }
+        }, waiting -> {
+            // Each chunk toggles this: back to the spinner while the next request queues, forward
+            // to the bar once it answers. Without the swap a 4-chunk run shows 0% three times.
+            receiving[0] = !waiting;
+            if (waiting) {
+                progress.dismiss();
+                aiSummaryDialog = connecting;
+                connecting.show();
+            } else {
+                connecting.dismiss();
+                aiSummaryDialog = progress;
+                progress.show();
+                progress.setMessage(partIndex[1] > 1
+                        ? LocaleController.formatString(R.string.AiSummaryGeneratingPart, partIndex[0], partIndex[1])
+                        : LocaleController.getString(R.string.AiSummaryGenerating));
             }
         }, cancellation, (summary, error) -> {
-            progress.dismiss();
+            dismissBoth.run();
             if (getParentActivity() == null) {
                 return;
             }
             if (error != null) {
-                new AlertDialog.Builder(getParentActivity(), themeDelegate)
+                boolean slow = AiSummary.ERROR_SLOW_RESPONSE.equals(error);
+                AlertDialog.Builder builder = new AlertDialog.Builder(getParentActivity(), themeDelegate)
                         .setTitle(LocaleController.getString(R.string.AiSummary))
-                        .setMessage(error)
-                        .setPositiveButton(LocaleController.getString(R.string.OK), null)
-                        .setNeutralButton(LocaleController.getString(R.string.Settings), (d, w) -> presentFragment(new AiSummarySettingsActivity()))
-                        .show();
+                        .setMessage(slow ? LocaleController.getString(R.string.AiSummarySlowModel) : error)
+                        .setNeutralButton(LocaleController.getString(R.string.Settings), (d, w) -> presentFragment(new AiSummarySettingsActivity()));
+                if (slow) {
+                    // Retry reuses the transcript already on hand: no second fetch, no second wait
+                    // for the range that was just downloaded.
+                    builder.setPositiveButton(LocaleController.getString(R.string.Retry),
+                            (d, w) -> sendAiSummary(transcript, restartAiSummary()));
+                } else {
+                    builder.setPositiveButton(LocaleController.getString(R.string.OK), null);
+                }
+                builder.show();
                 return;
             }
             final String text = AiSummaryFormat.format(summary);

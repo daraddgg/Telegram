@@ -1396,6 +1396,9 @@
     <string name="AiSummaryEmpty">No text messages loaded to summarize.</string>
     <string name="AiSummaryBadResponse">The model returned an unusable response. Try again, raise Max Tokens, or pick a model without reasoning output.</string>
     <string name="AiSummaryFetchError">Could not load chat history from Telegram: %1$s</string>
+    <string name="AiSummaryConnecting">Connecting to the model…</string>
+    <string name="AiSummaryConnectingPart">Connecting to the model… part %1$d of %2$d</string>
+    <string name="AiSummarySlowModel">The model is responding very slowly or is not reachable. Try again, or pick a different model in Settings.</string>
     <string name="AiSummaryPrivacyNotice">Loaded messages from this chat are sent to the AI provider you configure below. Credentials found in the text are redacted on-device first.</string>
     <string name="AiSummaryProvider">Provider</string>
     <string name="AiSummarySampling">Sampling</string>

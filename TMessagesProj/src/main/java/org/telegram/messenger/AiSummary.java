@@ -1,6 +1,7 @@
 package org.telegram.messenger;
 
 import android.content.SharedPreferences;
+import android.os.SystemClock;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -19,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
 /**
@@ -64,6 +66,20 @@ public class AiSummary {
         return Math.max(10, Math.min(100, limit / 10));
     }
     private static final int TIMEOUT_MS = 90000;
+    /**
+     * How long a request may stay completely silent before it is treated as a failure.
+     *
+     * A free-tier model can sit in a provider queue for minutes; the read timeout above never
+     * fires while keep-alive traffic trickles in, so the dialog used to sit at 0% indefinitely
+     * with no way to tell "queued" from "hung". Measured from the moment the payload is written:
+     * for a streaming request the clock stops at the first content token, for a plain request at
+     * the response headers.
+     */
+    private static final int FIRST_TOKEN_TIMEOUT_MS = 45000;
+    /** Absolute ceiling for one request, first token or not. */
+    private static final int TOTAL_RESPONSE_TIMEOUT_MS = 180000;
+    /** Marks the two watchdog failures so the UI can offer Retry instead of a raw message. */
+    public static final String ERROR_SLOW_RESPONSE = "ai_summary_slow_response";
     private static final int MAX_TEXT_CHARS = 400;
     private static final Pattern REASONING_TAG =
             Pattern.compile("(?is)<(think|thinking|reasoning)>.*?</\\1>");
@@ -170,6 +186,16 @@ public class AiSummary {
     /** Request-level progress: which chunk of how many is being summarized. */
     public interface Stage {
         void onStep(int done, int total);
+    }
+
+    /**
+     * Whether the current request is still waiting for the provider to say anything.
+     *
+     * A queued free-tier model produces no bytes for minutes, and a progress bar frozen at 0%
+     * reads as a crash. The UI uses this to switch between "connecting" and "receiving".
+     */
+    public interface Waiting {
+        void onWaiting(boolean waiting);
     }
 
     /**
@@ -324,12 +350,13 @@ public class AiSummary {
      * Runs the request off the main thread and delivers the result on the main thread.
      * Transcripts longer than one request are summarized in chunks and merged, never truncated.
      */
-    public static void request(List<String> transcript, Progress progress, Stage stage, Cancellation cancellation, Callback callback) {
+    public static void request(List<String> transcript, Progress progress, Stage stage, Waiting waiting,
+                              Cancellation cancellation, Callback callback) {
         Utilities.globalQueue.postRunnable(() -> {
             String summary = null;
             String error = null;
             try {
-                summary = summarize(transcript, progress, stage, cancellation);
+                summary = summarize(transcript, progress, stage, waiting, cancellation);
             } catch (Exception e) {
                 FileLog.e(e);
                 error = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
@@ -502,7 +529,7 @@ public class AiSummary {
         return Math.max(i, from + 1);
     }
 
-    private static String summarize(List<String> transcript, Progress progress, Stage stage, Cancellation cancellation) throws Exception {
+    private static String summarize(List<String> transcript, Progress progress, Stage stage, Waiting waiting, Cancellation cancellation) throws Exception {
         // Chunk boundaries are known before any request, so the user can be told "1 of 4" instead
         // of watching a still bar through four sequential calls.
         List<int[]> bounds = new ArrayList<>();
@@ -519,7 +546,7 @@ public class AiSummary {
                 AndroidUtilities.runOnUIThread(() -> stage.onStep(done, total));
             }
             int[] b = bounds.get(i);
-            partials.add(complete(systemPrompt(), join(transcript, b[0], b[1]), progress, cancellation));
+            partials.add(complete(systemPrompt(), join(transcript, b[0], b[1]), progress, waiting, cancellation));
         }
         // Incremental fold: the merge step is itself a request with the same context limit, so
         // merging 10 partials in one call would overflow exactly like the un-chunked transcript did.
@@ -534,7 +561,7 @@ public class AiSummary {
                     merged.add(partials.get(start));
                 } else {
                     merged.add(complete(systemPrompt() + "\n\n" + MERGE_INSTRUCTION,
-                            join(partials, start, end), progress, cancellation));
+                            join(partials, start, end), progress, waiting, cancellation));
                 }
                 start = end;
             }
@@ -669,7 +696,7 @@ public class AiSummary {
         return body.length() > 2000 ? body.substring(0, 2000) + "…" : body;
     }
 
-    private static String complete(String systemPrompt, String userContent, Progress progress, Cancellation cancellation) throws Exception {
+    private static String complete(String systemPrompt, String userContent, Progress progress, Waiting waiting, Cancellation cancellation) throws Exception {
         if (cancellation != null && cancellation.isCancelled()) {
             throw new Exception("cancelled");
         }
@@ -728,6 +755,37 @@ public class AiSummary {
         if (cancellation != null) {
             cancellation.attach(connection);
         }
+        // The watchdog owns the "silent provider" case that no socket timeout catches: it fires
+        // once and disconnects, which unblocks the reader thread exactly the way Cancel does.
+        // firstByte flips as soon as the provider says anything real, so a slow-but-alive stream
+        // is never killed mid-answer.
+        final AtomicBoolean firstByte = new AtomicBoolean();
+        final AtomicBoolean timedOut = new AtomicBoolean();
+        final long startedAt = SystemClock.elapsedRealtime();
+        final long[] ttfb = { -1 };
+        final HttpURLConnection watched = connection;
+        final Runnable firstByteWatchdog = () -> {
+            if (!firstByte.get()) {
+                timedOut.set(true);
+                watched.disconnect();
+            }
+        };
+        final Runnable totalWatchdog = () -> {
+            timedOut.set(true);
+            watched.disconnect();
+        };
+        if (waiting != null) {
+            AndroidUtilities.runOnUIThread(() -> waiting.onWaiting(true));
+        }
+        final Runnable markReceiving = () -> {
+            if (firstByte.compareAndSet(false, true)) {
+                ttfb[0] = SystemClock.elapsedRealtime() - startedAt;
+                AndroidUtilities.cancelRunOnUIThread(firstByteWatchdog);
+                if (waiting != null) {
+                    AndroidUtilities.runOnUIThread(() -> waiting.onWaiting(false));
+                }
+            }
+        };
         try {
             connection.setRequestMethod("POST");
             connection.setConnectTimeout(TIMEOUT_MS);
@@ -744,21 +802,32 @@ public class AiSummary {
                 connection.setRequestProperty("Authorization", "Bearer " + apiKey);
             }
             applyCustomHeaders(connection, prefs.getString(PREF_HEADERS, ""));
+            // Armed before the socket work, not after: a network that stalls the TCP/TLS handshake
+            // instead of refusing it would otherwise sit inside getOutputStream for the full
+            // connect timeout with the watchdog not yet running.
+            AndroidUtilities.runOnUIThread(firstByteWatchdog, FIRST_TOKEN_TIMEOUT_MS);
+            AndroidUtilities.runOnUIThread(totalWatchdog, TOTAL_RESPONSE_TIMEOUT_MS);
             try (OutputStream out = connection.getOutputStream()) {
                 out.write(payload);
             }
             int code = connection.getResponseCode();
             if (code >= 400) {
+                markReceiving.run();
                 String body = trimForError(readAll(connection.getErrorStream()));
                 if (BuildVars.LOGS_ENABLED) {
-                    FileLog.d("AiSummary: HTTP " + code + " body=" + body);
+                    FileLog.d("AiSummary: HTTP " + code + " after " + ttfb[0] + "ms body=" + body);
                 }
                 throw new Exception("HTTP " + code + ": " + body);
             }
             String content;
             if (stream) {
-                content = readStream(connection.getInputStream(), progress, cancellation);
+                // Streaming: headers arriving does not mean the model started generating, so the
+                // clock keeps running until a content delta lands.
+                content = readStream(connection.getInputStream(), progress, markReceiving, cancellation);
             } else {
+                // Non-streaming: the provider holds the connection until the whole answer exists,
+                // so response headers are the first real sign of life there is.
+                markReceiving.run();
                 String body = readAll(connection.getInputStream());
                 if (BuildVars.LOGS_ENABLED) {
                     // Whole response, not just the field we parse: shows whether reasoning came
@@ -779,7 +848,29 @@ public class AiSummary {
                 throw new Exception("empty response");
             }
             return content;
+        } catch (Exception e) {
+            // A watchdog disconnect surfaces as a generic IOException, so the real cause has to be
+            // rewritten here or the user sees "unexpected end of stream" for a queued model.
+            if (timedOut.get() && (cancellation == null || !cancellation.isCancelled())) {
+                long waited = SystemClock.elapsedRealtime() - startedAt;
+                if (BuildVars.LOGS_ENABLED) {
+                    FileLog.e("AiSummary: timing start=0 ttfb=" + (firstByte.get() ? ttfb[0] + "ms" : "never")
+                            + " aborted_after=" + waited + "ms model=" + model
+                            + " reason=" + (firstByte.get() ? "total response timeout" : "no first token"));
+                }
+                throw new Exception(ERROR_SLOW_RESPONSE);
+            }
+            throw e;
         } finally {
+            AndroidUtilities.cancelRunOnUIThread(firstByteWatchdog);
+            AndroidUtilities.cancelRunOnUIThread(totalWatchdog);
+            if (BuildVars.LOGS_ENABLED && !timedOut.get()) {
+                // The three numbers that decide whether the model or the network is at fault:
+                // ttfb above ~20s repeatedly means the free-tier queue, not the client.
+                FileLog.d("AiSummary: timing ttfb=" + (ttfb[0] < 0 ? "never" : ttfb[0] + "ms")
+                        + " total=" + (SystemClock.elapsedRealtime() - startedAt) + "ms"
+                        + " stream=" + stream + " model=" + model);
+            }
             if (cancellation != null) {
                 cancellation.detach();
             }
@@ -819,7 +910,7 @@ public class AiSummary {
      * The schema output is one JSON object, so showing partial text would put `{"executive_su` on
      * screen. Only the count is surfaced; the parsed object is still rendered once complete.
      */
-    private static String readStream(InputStream stream, Progress progress, Cancellation cancellation) throws Exception {
+    private static String readStream(InputStream stream, Progress progress, Runnable markReceiving, Cancellation cancellation) throws Exception {
         StringBuilder content = new StringBuilder();
         int tokens = 0;
         boolean truncated = false;
@@ -832,7 +923,12 @@ public class AiSummary {
                 truncated |= line.contains("\"finish_reason\":\"length\"") || line.contains("\"finish_reason\": \"length\"");
                 String delta = streamDelta(line);
                 if (delta == null) {
+                    // Keep-alive comments and role-only deltas are not the model generating text,
+                    // so they must not stop the first-token clock.
                     continue;
+                }
+                if (markReceiving != null) {
+                    markReceiving.run();
                 }
                 content.append(delta);
                 tokens++;
