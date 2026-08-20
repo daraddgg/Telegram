@@ -83,11 +83,16 @@ public class AiSummary {
     private static final int MAX_TEXT_CHARS = 400;
     private static final Pattern REASONING_TAG =
             Pattern.compile("(?is)<(think|thinking|reasoning)>.*?</\\1>");
+    /** Quoted snake_case JSON keys: Latin letters that belong to the schema, not to the answer. */
+    private static final Pattern SCHEMA_KEY = Pattern.compile("\"[a-z][a-z0-9_]*\"\\s*:");
 
-    public static final String DEFAULT_SYSTEM_PROMPT = "You are AI Summary Pro, a conversation-intelligence engine that converts Telegram\n"
-            + "group chat messages into structured, factual summaries.\n"
-            + "\n"
-            + "LANGUAGE IS NON-NEGOTIABLE: every single string value in your JSON output —\n"
+    /**
+     * The language rule, kept separate so it can be re-attached to a custom prompt.
+     *
+     * A user who edited the system prompt before this rule existed was sending a prompt with no
+     * language instruction at all, which is why the violation kept "coming back" after each fix.
+     */
+    static final String LANGUAGE_BLOCK = "LANGUAGE IS NON-NEGOTIABLE: every single string value in your JSON output —\n"
             + "in every field, from every chunk, in every merge step — must be in the\n"
             + "dominant language of the conversation, using only characters/words that\n"
             + "belong to that language (plus English JSON keys). Never insert a word,\n"
@@ -95,6 +100,21 @@ public class AiSummary {
             + "this before finalizing your response. Detect that dominant language from the\n"
             + "actual message text provided; never default to English. A word that was already\n"
             + "in another language in the source messages may stay as it was.\n"
+            + "This applies no matter how short the conversation is: 20 messages in Persian\n"
+            + "still require a fully Persian answer. The language of these instructions is\n"
+            + "irrelevant — never mirror it. If the messages use the Arabic script (Persian,\n"
+            + "Farsi, Dari, Arabic), every sentence you write must use that same script.";
+
+    /** Appended verbatim when a first attempt came back in the wrong script. */
+    private static final String LANGUAGE_RETRY_INSTRUCTION = "YOUR PREVIOUS ATTEMPT WAS REJECTED: it was written in the wrong language.\n"
+            + "Read the messages again, identify the script they are written in, and write\n"
+            + "EVERY string value in your JSON in that same script. Do not translate the\n"
+            + "conversation into English. Do not answer in the language of these instructions.";
+
+    public static final String DEFAULT_SYSTEM_PROMPT = "You are AI Summary Pro, a conversation-intelligence engine that converts Telegram\n"
+            + "group chat messages into structured, factual summaries.\n"
+            + "\n"
+            + LANGUAGE_BLOCK + "\n"
             + "\n"
             + "RULES:\n"
             + "1. Ground everything in the provided messages only. Never invent decisions, tasks,\n"
@@ -108,14 +128,25 @@ public class AiSummary {
             + "   literally said it. If the conversation is casual and provides no real\n"
             + "   technical/business substance, leave these sections mostly or entirely\n"
             + "   empty rather than manufacturing professional-sounding framing.\n"
-            + "4. NEVER diagnose, label, or speculate about anyone's mental health, emotional\n"
-            + "   state, or personal wellbeing. Do not write that someone seems depressed,\n"
-            + "   unmotivated, anxious, lonely, or needs support, and never suggest they get\n"
-            + "   help — not in ai_insights, not in sentiment.overall_mood, not anywhere. A\n"
-            + "   message like \"nothing feels good\" is a statement in the chat, not a\n"
-            + "   condition to assess. sentiment describes the tone of the CONVERSATION as a\n"
-            + "   whole, never the psychology of a participant. If a topic is personal or\n"
-            + "   sensitive, report only what was literally said, or leave the field empty.\n"
+            + "4. NEVER characterize a participant's personality, emotional traits, relationship\n"
+            + "   dynamics, or psychological state. This covers clinical labels (\"seems depressed\",\n"
+            + "   \"anxious\", \"unmotivated\", \"needs support\") AND soft, everyday phrasings that do\n"
+            + "   the same thing: \"seems sensitive about X\", \"they support each other emotionally\",\n"
+            + "   \"shows a close bond\", \"is insecure about\", \"cares deeply\", \"is frustrated with\".\n"
+            + "   Both are forbidden unless someone in the chat explicitly said that about\n"
+            + "   themselves or about the relationship, in which case you may quote or paraphrase\n"
+            + "   only what they said and attribute it to them.\n"
+            + "   ai_insights may describe WHICH topics came up and HOW OFTEN. It must never\n"
+            + "   describe WHY people feel a certain way or WHAT KIND OF PEOPLE they are.\n"
+            + "   When in doubt, state the observable fact and stop: \"weight was mentioned in\n"
+            + "   jokes on several occasions\" is allowed; \"both are sensitive about their weight\"\n"
+            + "   is not. Never add an interpretive layer on top of an observation.\n"
+            + "   A message like \"nothing feels good\" is a statement in the chat, not a condition\n"
+            + "   to assess. sentiment describes the tone of the CONVERSATION as a whole, never\n"
+            + "   the psychology of a participant. This applies to every field, including\n"
+            + "   ai_insights, sentiment.overall_mood, executive_summary and daily_recap. If a\n"
+            + "   topic is personal or sensitive, report only what was literally said, or leave\n"
+            + "   the field empty.\n"
             + "5. Anything already marked [REDACTED] stays redacted. Never reproduce a credential,\n"
             + "   API key, token, card number or password, even inside quotes or code blocks.\n"
             + "6. Quotes: at most 5, each under 25 words, each with speaker and time. Never alter\n"
@@ -281,9 +312,23 @@ public class AiSummary {
         return Math.min(99, tokens * 100 / max);
     }
 
+    /**
+     * The system prompt actually sent, with the language rule guaranteed present.
+     *
+     * A prompt the user customised before the language block existed has no language instruction
+     * at all, which is why "the language fix stopped working" kept recurring: the fix was in
+     * DEFAULT_SYSTEM_PROMPT while the stored copy was what got sent. The block is re-attached at
+     * the top of any custom prompt that lacks it instead of silently trusting the stored text.
+     */
     public static String systemPrompt() {
         String prompt = prefs().getString(PREF_SYSTEM_PROMPT, null);
-        return isEmpty(prompt) ? DEFAULT_SYSTEM_PROMPT : prompt;
+        if (isEmpty(prompt)) {
+            return DEFAULT_SYSTEM_PROMPT;
+        }
+        if (prompt.contains("LANGUAGE IS NON-NEGOTIABLE")) {
+            return prompt;
+        }
+        return LANGUAGE_BLOCK + "\n\n" + prompt;
     }
 
     /** Shows only the tail of a stored key so the UI never renders it in full. */
@@ -546,7 +591,9 @@ public class AiSummary {
                 AndroidUtilities.runOnUIThread(() -> stage.onStep(done, total));
             }
             int[] b = bounds.get(i);
-            partials.add(complete(systemPrompt(), join(transcript, b[0], b[1]), progress, waiting, cancellation));
+            String source = join(transcript, b[0], b[1]);
+            String partial = complete(systemPrompt(), source, progress, waiting, cancellation);
+            partials.add(enforceLanguage(partial, source, progress, waiting, cancellation));
         }
         // Incremental fold: the merge step is itself a request with the same context limit, so
         // merging 10 partials in one call would overflow exactly like the un-chunked transcript did.
@@ -560,8 +607,12 @@ public class AiSummary {
                     // than being re-summarized alone, which would only lose detail.
                     merged.add(partials.get(start));
                 } else {
-                    merged.add(complete(systemPrompt() + "\n\n" + MERGE_INSTRUCTION,
-                            join(partials, start, end), progress, waiting, cancellation));
+                    String source = join(partials, start, end);
+                    String result = complete(systemPrompt() + "\n\n" + MERGE_INSTRUCTION,
+                            source, progress, waiting, cancellation);
+                    // The merge step is where a correct Persian partial used to come back in
+                    // English, so it needs the same guard as the chunk step.
+                    merged.add(enforceLanguage(result, source, progress, waiting, cancellation));
                 }
                 start = end;
             }
@@ -652,6 +703,120 @@ public class AiSummary {
                 out.put(item);
             }
         }
+    }
+
+    /**
+     * Re-requests a summary once when it came back in a different script than the messages.
+     *
+     * Prompt-only defences kept failing on short ranges: 50 Persian messages came back fully
+     * English while 100 and 500 of the same chat were correct, which is a model coin flip no
+     * wording can close. Detection is script-level on purpose — telling Persian from Dari is not
+     * possible here and not needed, while Latin-vs-Arabic is unambiguous and is the failure that
+     * actually happens. One retry only: a second wrong answer is logged and returned rather than
+     * burning quota in a loop.
+     */
+    private static String enforceLanguage(String summary, String source, Progress progress,
+                                         Waiting waiting, Cancellation cancellation) throws Exception {
+        // summaryText on both sides: in the merge step the "source" is itself a set of JSON
+        // partials, and counting their English schema keys would make every merge look Latin.
+        // For a plain transcript there is no object to walk and the text passes through unchanged.
+        String want = dominantScript(summaryText(source));
+        String got = dominantScript(summaryText(summary));
+        if (want == null || got == null || want.equals(got)) {
+            return summary;
+        }
+        if (BuildVars.LOGS_ENABLED) {
+            FileLog.e("AiSummary: language mismatch input=" + want + " output=" + got + ", retrying once");
+        }
+        String retry = complete(systemPrompt() + "\n\n" + LANGUAGE_RETRY_INSTRUCTION,
+                source, progress, waiting, cancellation);
+        String retryScript = dominantScript(summaryText(retry));
+        if (BuildVars.LOGS_ENABLED) {
+            FileLog.d("AiSummary: language retry produced=" + retryScript
+                    + (want.equals(retryScript) ? " (fixed)" : " (still wrong, keeping it)"));
+        }
+        // Even a still-wrong retry is a complete summary; a second failure means the model cannot
+        // follow the rule, and an error dialog would be worse than a readable wrong-language answer.
+        return want.equals(retryScript) ? retry : summary;
+    }
+
+    /**
+     * Concatenated string values of a summary object, so detection sees the prose and not the
+     * English schema keys — which would make every output look Latin.
+     *
+     * The merge step passes several objects at once, which is not one parseable value; those fall
+     * back to stripping the snake_case keys textually. A plain transcript parses as neither and
+     * passes through unchanged, which is what detection wants.
+     */
+    static String summaryText(String summary) {
+        try {
+            String body = summary.trim();
+            int start = body.indexOf('{');
+            int end = body.lastIndexOf('}');
+            if (start < 0 || end <= start) {
+                return summary;
+            }
+            StringBuilder text = new StringBuilder();
+            collectStrings(new JSONObject(body.substring(start, end + 1)), text);
+            return text.toString();
+        } catch (Exception e) {
+            return SCHEMA_KEY.matcher(summary).replaceAll(" ");
+        }
+    }
+
+    private static void collectStrings(Object value, StringBuilder out) {
+        if (value instanceof JSONObject) {
+            JSONObject object = (JSONObject) value;
+            for (java.util.Iterator<String> it = object.keys(); it.hasNext(); ) {
+                collectStrings(object.opt(it.next()), out);
+            }
+        } else if (value instanceof JSONArray) {
+            JSONArray array = (JSONArray) value;
+            for (int i = 0; i < array.length(); i++) {
+                collectStrings(array.opt(i), out);
+            }
+        } else if (value instanceof String) {
+            out.append(' ').append(value);
+        }
+    }
+
+    /**
+     * "arabic", "cyrillic", "latin" or null when there is not enough letter evidence to judge.
+     *
+     * Only letters count: digits, punctuation, timestamps and URLs are script-neutral and a
+     * transcript is full of them. A single foreign word does not flip the verdict — the winner
+     * needs a clear majority, so a Persian summary quoting an English product name still reads as
+     * Arabic script.
+     */
+    static String dominantScript(String text) {
+        if (text == null) {
+            return null;
+        }
+        int arabic = 0;
+        int cyrillic = 0;
+        int latin = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c >= 0x0600 && c <= 0x06FF || c >= 0x0750 && c <= 0x077F || c >= 0xFB50 && c <= 0xFDFF
+                    || c >= 0xFE70 && c <= 0xFEFF) {
+                arabic++;
+            } else if (c >= 0x0400 && c <= 0x04FF) {
+                cyrillic++;
+            } else if (c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+                latin++;
+            }
+        }
+        int total = arabic + cyrillic + latin;
+        // Below this there is no signal: an empty schema or a two-word note must not trigger a
+        // retry that costs a whole request.
+        if (total < 40) {
+            return null;
+        }
+        int best = Math.max(arabic, Math.max(cyrillic, latin));
+        if (best * 2 <= total) {
+            return null;
+        }
+        return best == arabic ? "arabic" : best == cyrillic ? "cyrillic" : "latin";
     }
 
     /**
