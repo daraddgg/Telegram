@@ -103,7 +103,10 @@ public class AiSummary {
             + "This applies no matter how short the conversation is: 20 messages in Persian\n"
             + "still require a fully Persian answer. The language of these instructions is\n"
             + "irrelevant — never mirror it. If the messages use the Arabic script (Persian,\n"
-            + "Farsi, Dari, Arabic), every sentence you write must use that same script.";
+            + "Farsi, Dari, Arabic), every sentence you write must use that same script.\n"
+            + "Exception: proper nouns, product/brand/technology names, API names, library\n"
+            + "names, repository names, usernames, and URLs keep their original form and\n"
+            + "are never translated, even when everything else is in the dominant language.";
 
     /** Appended verbatim when a first attempt came back in the wrong script. */
     private static final String LANGUAGE_RETRY_INSTRUCTION = "YOUR PREVIOUS ATTEMPT WAS REJECTED: it was written in the wrong language.\n"
@@ -147,19 +150,33 @@ public class AiSummary {
             + "   ai_insights, sentiment.overall_mood, executive_summary and daily_recap. If a\n"
             + "   topic is personal or sensitive, report only what was literally said, or leave\n"
             + "   the field empty.\n"
+            + "   sentiment.overall_mood describes the tone/register of the CONVERSATION as a\n"
+            + "   whole (\"friendly and humorous\", \"serious and formal\", \"neutral\", \"mixed\" —\n"
+            + "   written in the output language) — never a participant's emotional or mental\n"
+            + "   state (\"worried\", \"anxious\", \"sad\"). If a participant literally stated a\n"
+            + "   feeling, that fact belongs in daily_recap or executive_summary as an\n"
+            + "   attributed statement, not in overall_mood.\n"
             + "5. Anything already marked [REDACTED] stays redacted. Never reproduce a credential,\n"
             + "   API key, token, card number or password, even inside quotes or code blocks.\n"
             + "6. Quotes: at most 5, each under 25 words, each with speaker and time. Never alter\n"
             + "   the wording.\n"
-            + "7. Sentiment percentages must sum to 100.\n"
-            + "8. Leave statistics at 0 — the app fills in the real counts itself.\n"
+            + "7. Sentiment percentages must sum to 100. They should reflect the overall mix of\n"
+            + "   tone across the conversation's substantive messages, not be derived mechanically\n"
+            + "   from raw message counts. This is a coarse estimate; consistency matters more\n"
+            + "   than precision.\n"
+            + "8. Leave statistics at 0 — the app fills in the real counts itself. Likewise, do not\n"
+            + "   compute message counts for most_active_members: the app computes those\n"
+            + "   deterministically from the same message batch. Return most_active_members empty\n"
+            + "   or omit it — anything you put there is discarded.\n"
             + "9. If the range contains zero usable messages, return the schema with empty fields\n"
             + "   and set meta.note to explain why.\n"
             + "10. DATES — For any date or timestamp you output (timeline entries, quote timestamps,\n"
             + "   etc.), use ONLY the exact date/time values provided with each message in\n"
             + "   the input. Never infer, assume, or default to a year or date from your own\n"
             + "   training data or general knowledge — if a message's date isn't explicitly\n"
-            + "   provided in the input, omit the date rather than guessing one.\n"
+            + "   provided in the input, omit the date rather than guessing one. If an input\n"
+            + "   message provides only a time without an explicit date, output only the time\n"
+            + "   (HH:MM) for that entry — do not attach a guessed date.\n"
             + "11. Output ONLY valid JSON matching the schema below. No markdown fences, no\n"
             + "   commentary, no preamble or postamble.\n"
             + "12. TIMELINE — Collapse repetition. If the same type of message or action repeats\n"
@@ -178,6 +195,8 @@ public class AiSummary {
             + "   convert it to https://t.me/username (drop the @). A t.me/... or example.com/...\n"
             + "   without a scheme gets https:// prefixed. If something cannot be turned into a\n"
             + "   real URL, leave it out of important_links and mention it in the prose instead.\n"
+            + "15. meta.language must be an ISO 639-1 two-letter code (e.g. \"fa\", \"en\", \"ar\"),\n"
+            + "   never a full language name written out.\n"
             + "\n"
             + "SIGNIFICANCE FILTER — apply before populating any section:\n"
             + "- Casual banter, jokes, teasing, and rhetorical questions between friends are\n"
@@ -195,7 +214,7 @@ public class AiSummary {
             + "\n"
             + "SCHEMA:\n"
             + "{\n"
-            + "  \"meta\": { \"range\": \"string\", \"language\": \"string\", \"note\": \"string|null\" },\n"
+            + "  \"meta\": { \"range\": \"string\", \"language\": \"ISO 639-1 two-letter code, e.g. fa/en/ar\", \"note\": \"string|null\" },\n"
             + "  \"one_sentence_summary\": \"string\",\n"
             + "  \"executive_summary\": \"string\",\n"
             + "  \"daily_recap\": \"string\",\n"
@@ -207,12 +226,12 @@ public class AiSummary {
             + "  \"ideas_suggestions\": [\"string\"],\n"
             + "  \"shared_content\": { \"photos\": 0, \"videos\": 0, \"voice_messages\": 0, \"documents\": 0, \"links\": 0 },\n"
             + "  \"important_links\": [{ \"title\": \"string\", \"url\": \"string\" }],\n"
-            + "  \"most_active_members\": [{ \"name\": \"string\", \"message_count\": 0 }],\n"
-            + "  \"timeline\": [{ \"time\": \"YYYY-MM-DDTHH:MM (copied from the input, never invented)\", \"event\": \"string\" }],\n"
+            + "  \"most_active_members\": [],\n"
+            + "  \"timeline\": [{ \"time\": \"YYYY-MM-DDTHH:MM if a full date+time is available in the input; otherwise just HH:MM if only a time was given. Copied exactly from the input — never invented.\", \"event\": \"string\" }],\n"
             + "  \"ai_insights\": [\"string\"],\n"
             + "  \"sentiment\": { \"positive_pct\": 0, \"neutral_pct\": 0, \"negative_pct\": 0, \"overall_mood\": \"string\" },\n"
             + "  \"statistics\": { \"messages\": 0, \"participants\": 0, \"links\": 0, \"duration_minutes\": 0 },\n"
-            + "  \"important_quotes\": [{ \"text\": \"string\", \"author\": \"string\", \"time\": \"copied from the input, never invented\" }],\n"
+            + "  \"important_quotes\": [{ \"text\": \"string\", \"author\": \"string\", \"time\": \"YYYY-MM-DDTHH:MM if a full date+time is available in the input; otherwise just HH:MM if only a time was given. Copied exactly from the input — never invented.\" }],\n"
             + "  \"technical_summary\": { \"technologies\": [\"string\"], \"apis\": [\"string\"], \"libraries\": [\"string\"], \"repositories\": [\"string\"], \"errors\": [\"string\"] },\n"
             + "  \"business_summary\": { \"decisions\": [\"string\"], \"deadlines\": [\"string\"], \"risks\": [\"string\"], \"stakeholders\": [\"string\"], \"deliverables\": [\"string\"] }\n"
             + "}";
@@ -671,7 +690,7 @@ public class AiSummary {
     }
 
     /**
-     * Overwrites the model's statistics block with counts computed from the transcript itself.
+     * Overwrites the model's statistics and most_active_members with counts from the transcript.
      *
      * The model guessed these numbers, which is why three different ranges reported nearly the
      * same duration_minutes. The transcript is the ground truth: it is exactly what was sent.
@@ -690,7 +709,9 @@ public class AiSummary {
                 stats = new JSONObject();
                 root.put("statistics", stats);
             }
-            java.util.Set<String> senders = new java.util.LinkedHashSet<>();
+            // Insertion-ordered so equal counts keep the order senders first appear in the chat,
+            // which makes the ranking stable across runs of the same range.
+            java.util.LinkedHashMap<String, Integer> counts = new java.util.LinkedHashMap<>();
             long first = 0;
             long last = 0;
             for (String line : transcript) {
@@ -711,18 +732,35 @@ public class AiSummary {
                 }
                 int colon = line.indexOf(": ", close);
                 if (colon > close) {
-                    senders.add(line.substring(close + 2, colon));
+                    String sender = line.substring(close + 2, colon);
+                    Integer seen = counts.get(sender);
+                    counts.put(sender, seen == null ? 1 : seen + 1);
                 }
             }
             stats.put("messages", transcript.size());
-            stats.put("participants", senders.size());
+            stats.put("participants", counts.size());
             stats.put("duration_minutes", first > 0 && last > first ? (last - first) / 60000L : 0);
+            // Whatever the model returned here is discarded: the app counted the same batch and
+            // cannot be wrong about it, while the model was inventing per-person totals.
+            root.put("most_active_members", activeMembers(counts));
             return root.toString();
         } catch (Exception e) {
             // Never lose a good summary over a statistics rewrite.
             FileLog.e(e);
             return summary;
         }
+    }
+
+    /** Senders ranked by message count, highest first, ties in first-seen order. */
+    private static JSONArray activeMembers(java.util.LinkedHashMap<String, Integer> counts) throws Exception {
+        List<java.util.Map.Entry<String, Integer>> ranked = new ArrayList<>(counts.entrySet());
+        // Stable sort on the descending count keeps the insertion order of equal counts.
+        java.util.Collections.sort(ranked, (a, b) -> b.getValue() - a.getValue());
+        JSONArray members = new JSONArray();
+        for (java.util.Map.Entry<String, Integer> entry : ranked) {
+            members.put(new JSONObject().put("name", entry.getKey()).put("message_count", entry.getValue()));
+        }
+        return members;
     }
 
     private static long parseStamp(String value) {
