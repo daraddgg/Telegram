@@ -162,6 +162,22 @@ public class AiSummary {
             + "   provided in the input, omit the date rather than guessing one.\n"
             + "11. Output ONLY valid JSON matching the schema below. No markdown fences, no\n"
             + "   commentary, no preamble or postamble.\n"
+            + "12. TIMELINE — Collapse repetition. If the same type of message or action repeats\n"
+            + "   more than 3 times within a short window (a few minutes to an hour), write ONE\n"
+            + "   entry describing the pattern and its time range instead of one entry per\n"
+            + "   occurrence — for example \"between 01:57 and 02:52 this request was repeated\n"
+            + "   25+ times\". Never output more than 3 near-identical consecutive timeline\n"
+            + "   entries. The timeline is a story of what happened, not a log of every message.\n"
+            + "13. REAL WORDS ONLY — Use only real, standard words of the output language. If you\n"
+            + "   are unsure whether a word exists or how to phrase something, use a simpler and\n"
+            + "   more common word instead of inventing or garbling one. Never emit a string that\n"
+            + "   is not a real word in the output language. Prefer plain, everyday vocabulary\n"
+            + "   over rare or elaborate constructions.\n"
+            + "14. LINKS — important_links.url must always be a clickable absolute URL starting\n"
+            + "   with http:// or https://. A Telegram @username or channel mention is not a URL:\n"
+            + "   convert it to https://t.me/username (drop the @). A t.me/... or example.com/...\n"
+            + "   without a scheme gets https:// prefixed. If something cannot be turned into a\n"
+            + "   real URL, leave it out of important_links and mention it in the prose instead.\n"
             + "\n"
             + "SIGNIFICANCE FILTER — apply before populating any section:\n"
             + "- Casual banter, jokes, teasing, and rhetorical questions between friends are\n"
@@ -410,10 +426,176 @@ public class AiSummary {
             if (cancellation != null && cancellation.isCancelled()) {
                 return;
             }
-            final String resultSummary = summary == null ? null : applyStatistics(summary, transcript);
+            final String resultSummary = summary == null ? null : normalizeOutput(applyStatistics(summary, transcript));
             final String resultError = error;
             AndroidUtilities.runOnUIThread(() -> callback.onResult(resultSummary, resultError));
         });
+    }
+
+    /**
+     * Post-processes the model's object for the two things a prompt rule cannot guarantee:
+     * a timeline that repeats one event dozens of times, and a "link" that is not a link.
+     *
+     * Both were asked of the model in RULES 12 and 14; this is the deterministic backstop for when
+     * it ignores them. Applied after applyStatistics so a failure here cannot lose the summary.
+     */
+    static String normalizeOutput(String summary) {
+        try {
+            String body = summary.trim();
+            int start = body.indexOf('{');
+            int end = body.lastIndexOf('}');
+            if (start < 0 || end <= start) {
+                return summary;
+            }
+            JSONObject root = new JSONObject(body.substring(start, end + 1));
+            JSONArray timeline = root.optJSONArray("timeline");
+            if (timeline != null) {
+                root.put("timeline", collapseTimeline(timeline));
+            }
+            JSONArray links = root.optJSONArray("important_links");
+            if (links != null) {
+                root.put("important_links", normalizeLinks(links));
+            }
+            return root.toString();
+        } catch (Exception e) {
+            FileLog.e(e);
+            return summary;
+        }
+    }
+
+    /**
+     * Folds runs of near-identical consecutive entries into one, keeping the time span.
+     *
+     * A chat where one request is repeated 25 times produced 25 timeline rows, which buries the
+     * events that only happened once. The marker appended to the kept entry is digits and
+     * punctuation only — "×25 (01:57–02:52)" — so it carries no language of its own and cannot
+     * reintroduce the wrong-script problem.
+     */
+    static JSONArray collapseTimeline(JSONArray timeline) {
+        JSONArray out = new JSONArray();
+        int i = 0;
+        while (i < timeline.length()) {
+            String key = timelineKey(timeline.opt(i));
+            int run = 1;
+            while (i + run < timeline.length() && key != null && key.equals(timelineKey(timeline.opt(i + run)))) {
+                run++;
+            }
+            if (run <= 3) {
+                for (int j = 0; j < run; j++) {
+                    out.put(timeline.opt(i + j));
+                }
+            } else {
+                Object first = timeline.opt(i);
+                Object last = timeline.opt(i + run - 1);
+                if (first instanceof JSONObject) {
+                    try {
+                        JSONObject collapsed = new JSONObject(first.toString());
+                        String from = clockOf(first);
+                        String to = clockOf(last);
+                        String span = from.isEmpty() || to.isEmpty() || from.equals(to)
+                                ? "" : " (" + from + "–" + to + ")";
+                        collapsed.put("event", collapsed.optString("event", "").trim() + " ×" + run + span);
+                        out.put(collapsed);
+                    } catch (Exception e) {
+                        out.put(first);
+                    }
+                } else {
+                    out.put(first);
+                }
+            }
+            i += run;
+        }
+        return out;
+    }
+
+    /** Comparison key for a timeline entry: its event text reduced to letters and digits. */
+    private static String timelineKey(Object entry) {
+        String event = entry instanceof JSONObject
+                ? ((JSONObject) entry).optString("event", "")
+                : String.valueOf(entry);
+        StringBuilder key = new StringBuilder();
+        for (int i = 0; i < event.length(); i++) {
+            char c = event.charAt(i);
+            if (Character.isLetterOrDigit(c)) {
+                key.append(Character.toLowerCase(c));
+            }
+        }
+        return key.length() == 0 ? null : key.toString();
+    }
+
+    /** "HH:MM" out of an ISO timestamp, or the raw value when it is already a clock time. */
+    private static String clockOf(Object entry) {
+        if (!(entry instanceof JSONObject)) {
+            return "";
+        }
+        String time = ((JSONObject) entry).optString("time", "").trim();
+        int t = time.indexOf('T');
+        if (t >= 0 && time.length() >= t + 6) {
+            return time.substring(t + 1, t + 6);
+        }
+        return time.length() == 5 && time.charAt(2) == ':' ? time : "";
+    }
+
+    /**
+     * Makes every important_links entry clickable, dropping the ones that cannot be.
+     *
+     * The model returned a Telegram mention (@channel) as a url, which renders as dead text. A
+     * mention becomes https://t.me/name, a scheme-less host gets https://, and anything else is
+     * removed rather than shown as a link that does nothing.
+     */
+    static JSONArray normalizeLinks(JSONArray links) {
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < links.length(); i++) {
+            Object item = links.opt(i);
+            if (item instanceof JSONObject) {
+                JSONObject link = (JSONObject) item;
+                String url = normalizeUrl(link.optString("url", ""));
+                if (url.isEmpty()) {
+                    continue;
+                }
+                try {
+                    JSONObject copy = new JSONObject(link.toString());
+                    copy.put("url", url);
+                    out.put(copy);
+                } catch (Exception e) {
+                    out.put(item);
+                }
+            } else {
+                String url = normalizeUrl(String.valueOf(item));
+                if (!url.isEmpty()) {
+                    out.put(url);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Absolute URL for a mention or scheme-less host, or "" when the value is not link-like. */
+    static String normalizeUrl(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String value = raw.trim();
+        if (value.isEmpty() || "null".equals(value)) {
+            return "";
+        }
+        if (value.startsWith("http://") || value.startsWith("https://")) {
+            return value;
+        }
+        if (value.startsWith("@")) {
+            String name = value.substring(1).trim();
+            // Telegram usernames are letters, digits and underscore; anything else is prose that
+            // happened to start with @, not a mention.
+            return name.matches("[A-Za-z0-9_]{3,}") ? "https://t.me/" + name : "";
+        }
+        if (value.startsWith("t.me/") || value.startsWith("www.")) {
+            return "https://" + value;
+        }
+        // host/path with a plausible TLD and no spaces: the model dropped the scheme.
+        if (!value.contains(" ") && value.matches("[A-Za-z0-9._~-]+\\.[A-Za-z]{2,}(/\\S*)?")) {
+            return "https://" + value;
+        }
+        return "";
     }
 
     /**
